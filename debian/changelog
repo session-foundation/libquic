@@ -1,3 +1,10 @@
+oxen-libquic (1.6.0-2~deb12) bookworm; urgency=medium
+
+  * bump required oxenc/logging versions
+  * Build with -DNDEBUG
+
+ -- Jason Rhinelander <jason@session.foundation>  Tue, 25 Nov 2025 21:01:09 -0400
+
 oxen-libquic (1.6.0-1~deb12) bookworm; urgency=medium
 
   [ Jason Rhinelander ]
