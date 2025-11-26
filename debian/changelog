@@ -1,3 +1,10 @@
+oxen-libquic (1.6.0-2~ubuntu2204) jammy; urgency=medium
+
+  * reduce jobs on arm64 jammy
+  * Build with -DNDEBUG
+
+ -- Jason Rhinelander <jason@session.foundation>  Tue, 25 Nov 2025 21:03:08 -0400
+
 oxen-libquic (1.6.0-1~ubuntu2204+2) jammy; urgency=medium
 
   * Rebuild jammy again, to bump arm64 build.
