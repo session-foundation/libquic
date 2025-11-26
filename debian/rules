@@ -10,7 +10,8 @@ include /usr/share/dpkg/pkg-info.mk
 
 # see ENVIRONMENT in dpkg-buildflags(1)
 # package maintainers to append CFLAGS
-#export DEB_CFLAGS_MAINT_APPEND  = -Wall -pedantic
+export DEB_CFLAGS_MAINT_APPEND  = -DNDEBUG
+export DEB_CXXFLAGS_MAINT_APPEND  = -DNDEBUG
 # package maintainers to append LDFLAGS
 #export DEB_LDFLAGS_MAINT_APPEND = -Wl,--as-needed
 
