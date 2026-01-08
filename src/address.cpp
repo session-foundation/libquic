@@ -212,18 +212,18 @@ namespace oxen::quic
 
     std::string Address::host() const
     {
-        char buf[INET6_ADDRSTRLEN] = {};
+        char buf[INET6_ADDRSTRLEN];
         if (is_ipv6())
-        {
             inet_ntop(AF_INET6, &reinterpret_cast<const sockaddr_in6&>(_sock_addr).sin6_addr, buf, sizeof(buf));
-            return "[{}]"_format(buf);
-        }
-        inet_ntop(AF_INET, &reinterpret_cast<const sockaddr_in&>(_sock_addr).sin_addr, buf, sizeof(buf));
-        return "{}"_format(buf);
+        else
+            inet_ntop(AF_INET, &reinterpret_cast<const sockaddr_in&>(_sock_addr).sin_addr, buf, sizeof(buf));
+        return buf;
     }
 
     std::string Address::to_string() const
     {
+        if (is_ipv6())
+            return "[{}]:{}"_format(host(), port());
         return "{}:{}"_format(host(), port());
     }
 
