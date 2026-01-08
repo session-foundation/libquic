@@ -238,11 +238,6 @@ namespace oxen::quic
         // the base class method to properly set the _received_fin bit.
         virtual void on_fin();
 
-        /// Called periodically to check if anything needs to be timed out.  The default does
-        /// nothing, but subclasses can override to not do nothing if it's not the case that nothing
-        /// ain't not good enough isn't false.
-        virtual void check_timeouts() {}
-
         void send_impl(std::span<const std::byte> data, std::shared_ptr<void> keep_alive) override;
 
         stream_buffer user_buffers;

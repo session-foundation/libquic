@@ -18,6 +18,7 @@
 #include <array>
 #include <cassert>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <list>
@@ -146,17 +147,6 @@ namespace oxen::quic
         }
         else
             log::info(log_cat, "Endpoint enabled with manual packet routing -- bypassing UDP socket creation!");
-
-        expiry_timer.reset(event_new(
-                loop.get_event_base(),
-                -1,          // Not attached to an actual socket
-                EV_PERSIST,  // Stays active (i.e. repeats) once fired
-                [](evutil_socket_t, short, void* self) { static_cast<Endpoint*>(self)->check_timeouts(); },
-                this));
-        timeval exp_interval;
-        exp_interval.tv_sec = 0;
-        exp_interval.tv_usec = 250'000;
-        event_add(expiry_timer.get(), &exp_interval);
     }
 
     void Endpoint::_listen()
@@ -268,6 +258,22 @@ namespace oxen::quic
         socket.reset();
     }
 
+    void Endpoint::schedule_conn_cleanup(Connection& conn)
+    {
+        loop.call_later(
+                std::chrono::microseconds{(ngtcp2_conn_get_pto(conn) * 3 + 999) / 1000},
+                [this, wself = weak_from_this(), cid = conn.reference_id()] {
+                    auto self = wself.lock();
+                    if (!self)
+                        return;
+
+                    auto it = conns.find(cid);
+                    if (it == conns.end())
+                        return;
+
+                    delete_connection(*it->second.get());
+                });
+    }
     void Endpoint::drain_connection(Connection& conn)
     {
         if (conn.is_draining() || conn.is_closing())
@@ -286,7 +292,7 @@ namespace oxen::quic
 
         _execute_close_hooks(conn, io_error{err->error_code});
 
-        draining_closing.emplace(get_time() + ngtcp2_conn_get_pto(conn) * 3 * 1ns, conn.reference_id());
+        schedule_conn_cleanup(conn);
 
         log::debug(log_cat, "Connection ({}) marked as draining", conn.reference_id());
     }
@@ -485,7 +491,7 @@ namespace oxen::quic
 
         log::debug(log_cat, "Marked connection ({}) as closing; sending close packet", conn.reference_id());
 
-        draining_closing.emplace(get_time() + ngtcp2_conn_get_pto(conn) * 3 * 1ns, conn.reference_id());
+        schedule_conn_cleanup(conn);
 
         send_or_queue_packet(conn.path(), std::move(buf), /*ecn=*/0, [this, &conn](io_result rv) {
             if (rv.failure())
@@ -1130,31 +1136,6 @@ namespace oxen::quic
         buf.resize(nwrite);
 
         send_or_queue_packet(p, std::move(buf), /*ecn=*/0);
-    }
-
-    void Endpoint::check_timeouts()
-    {
-        auto now = get_time();
-
-        for (auto it_a = draining_closing.begin(); it_a != draining_closing.end();)
-        {
-            if (it_a->first < now)
-            {
-                if (auto it_b = conns.find(it_a->second); it_b != conns.end())
-                {
-                    log::debug(log_cat, "Deleting closing/draining connection ({})", it_b->first);
-                    delete_connection(*it_b->second.get());
-                }
-
-                it_a = draining_closing.erase(it_a);
-            }
-            else
-                ++it_a;
-        }
-
-        // Propagate the timeout check to connections, to be propagated to streams
-        for (auto& [cid, conn] : conns)
-            conn->check_stream_timeouts();
     }
 
     std::shared_ptr<Connection> Endpoint::get_conn(ConnectionID rid)

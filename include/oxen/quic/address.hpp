@@ -302,6 +302,8 @@ namespace oxen::quic
         // sockaddr pointer).
         void update_socklen(socklen_t len) { _addr.addrlen = len; }
 
+        // Returns the "host" part of the address (i.e. the IP address) as a string.  For IPv6
+        // addresses this does *not* include [ ], but note that in older versions of libquic it did.
         std::string host() const;
 
         // Convenience method for debugging, etc.  This is usually called implicitly by passing the
