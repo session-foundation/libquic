@@ -26,19 +26,11 @@ namespace oxen::quic
                     log::info(ev_cat, "{}", msg);
                     break;
                 case _EVENT_LOG_DEBUG:
+                default:
                     log::debug(ev_cat, "{}", msg);
                     break;
             }
-            std::abort();
         });
-    }
-
-    static timeval loop_time_to_timeval(std::chrono::microseconds t)
-    {
-#ifdef _WIN32
-        using suseconds_t = long;
-#endif
-        return timeval{.tv_sec = static_cast<time_t>(t / 1s), .tv_usec = static_cast<suseconds_t>((t % 1s) / 1us)};
     }
 
     bool Ticker::start()
