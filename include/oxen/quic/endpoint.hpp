@@ -173,7 +173,6 @@ namespace oxen::quic
         }
 
         Address _local;
-        event_ptr expiry_timer;
         std::unique_ptr<UDPSocket> socket;
         bool _accepting_inbound{false};
         bool _datagrams{false};
@@ -259,6 +258,7 @@ namespace oxen::quic
 
         void delete_connection(Connection& conn);
         void drain_connection(Connection& conn);
+        void schedule_conn_cleanup(Connection& conn);
 
         void connection_established(Connection& conn);
 
@@ -361,8 +361,6 @@ namespace oxen::quic
         void send_stateless_reset(const Packet& pkt, const quic_cid& cid);
 
         void send_version_negotiation(const ngtcp2_version_cid& vid, Path p);
-
-        void check_timeouts();
 
         // Attempts to interpret the packet as an initial connection.  If the packet is acceptable,
         // a new Connection is created and a pointer to it is returned.  The bool indicates whether

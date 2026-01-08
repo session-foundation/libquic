@@ -566,7 +566,7 @@ namespace oxen::quic::test
                 max_unsplit * 2);
         int lookahead = GENERATE(-1 /* should become the default, i.e. 8*/, 0, 1, 5, 10, 100);
 
-        log::warning(log_cat, "DGRAM_SIZE: {}, LOOKAHEAD: {}", dgram_size, lookahead);
+        log::debug(log_cat, "DGRAM_SIZE: {}, LOOKAHEAD: {}", dgram_size, lookahead);
         conn_interface->set_split_datagram_lookahead(lookahead);
 
         if (dgram_size <= max_unsplit)
@@ -575,7 +575,7 @@ namespace oxen::quic::test
             // padding, so add those back in, then divide to see how many we can fit where each
             // include that 5 byte overhead:
             auto max_coalesced = (max_unsplit + 3 + 5) / (dgram_size + 5);
-            log::warning(log_cat, "max coal: {}", max_coalesced);
+            log::debug(log_cat, "max coal: {}", max_coalesced);
             target_dgrams = n / max_coalesced;
         }
         else
@@ -586,7 +586,7 @@ namespace oxen::quic::test
             auto packable = std::min<size_t>(
                     2 + (lookahead < 0 ? dgram::queue::DEFAULT_SPLIT_LOOKAHEAD : lookahead),
                     (max_unsplit + 3 + 5) / (dgram_size - max_unsplit + 5));
-            log::warning(log_cat, "packable: {}", packable);
+            log::debug(log_cat, "packable: {}", packable);
             target_dgrams = n + (n + packable - 1) / packable;
         }
 

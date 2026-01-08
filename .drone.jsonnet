@@ -344,8 +344,10 @@ local mac_builder(name,
               arch='arm64'),
   mac_builder('macOS (Release, Intel)', tests=false),
   mac_builder('macOS (Debug, Intel)', build_type='Debug', tests=false),
+  /* Disabled for now because the Intel mac builder is missing some basic dependencies:
   mac_builder('macOS (Static, Intel)',
               cmake_extra='-DBUILD_STATIC_DEPS=ON',
               lto=true,
               tests=false),
+              */
 ]
