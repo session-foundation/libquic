@@ -1,3 +1,19 @@
+oxen-libquic (1.7.0-1~deb13) trixie; urgency=medium
+
+  * bump dev branch version for next release
+  * downgrade test warnings
+  * Remove [square-brackets] from Address::host()
+  * Fix btreq response callback matching and timeout blockage
+  * fix typo
+  * Remove endpoint 250ms tick for BTRequestStream
+  * CI: disable static mac Intel build
+  * Fix test suite race conditions
+  * Work around Apple's incredibly awful thread scheduling
+  * Fix opt::stream_notify sometimes not working
+  * Remove unwanted std::abort
+
+ -- Jason Rhinelander <jason@session.foundation>  Thu, 08 Jan 2026 16:13:32 -0400
+
 oxen-libquic (1.6.0-2~deb13) trixie; urgency=medium
 
   * bump required oxenc/logging versions
