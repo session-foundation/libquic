@@ -124,7 +124,7 @@ namespace oxen::quic
         }
 
         auto expires_in =
-                std::chrono::ceil<std::chrono::microseconds>(std::chrono::steady_clock::now() - req_expiries.begin()->first);
+                std::chrono::ceil<std::chrono::microseconds>(req_expiries.begin()->first - std::chrono::steady_clock::now());
         if (expires_in < 0us)
             expires_in = 0us;
 #ifdef _WIN32
