@@ -26,8 +26,8 @@ local deb_pipeline(image, buildarch='amd64', debarch='amd64', jobs=6) = {
       commands: [
         'echo "Building on ${DRONE_STAGE_MACHINE}"',
         'echo "man-db man-db/auto-update boolean false" | debconf-set-selections',
-        'cp debian/deb.oxen.io.gpg /etc/apt/trusted.gpg.d/deb.oxen.io.gpg',
-        'echo deb http://deb.oxen.io' + repo_suffix + ' ' + distro + ' main >/etc/apt/sources.list.d/oxen.list',
+        'cp debian/deb.session.foundation.gpg /usr/share/keyrings/session-foundation.gpg',
+        'echo "Types: deb\nURIs: https://deb.session.foundation' + repo_suffix + '\nSuites: ' + distro + '\nComponents: main\nSigned-By: /usr/share/keyrings/session-foundation.gpg" >/etc/apt/sources.list.d/session.sources',
         apt_get_quiet + ' update',
         apt_get_quiet + ' install -y eatmydata',
         'eatmydata ' + apt_get_quiet + ' dist-upgrade -y',
