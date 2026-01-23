@@ -1,3 +1,9 @@
+oxen-libquic (1.7.1-1~ubuntu2504) plucky; urgency=medium
+
+  * Fix backwards time logic
+
+ -- Jason Rhinelander <jason@session.foundation>  Fri, 23 Jan 2026 18:32:53 -0400
+
 oxen-libquic (1.7.0-1~ubuntu2504) plucky; urgency=medium
 
   * bump dev branch version for next release
