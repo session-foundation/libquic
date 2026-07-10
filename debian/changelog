@@ -1,3 +1,51 @@
+oxen-libquic (1.8.0-1) unstable; urgency=medium
+
+  [ Jason Rhinelander ]
+  * update repo key & apt sources file
+  * Fixes and improvements to btreqtest and other test scripts
+  * Fix a rare crash in 0rtt tests due to packet_delayer
+  * Fix test suite thread safety
+  * JobQueue tweaks
+  * bump oxen-logging
+  * Redo dependencies with new session-deps repo
+  * CI: new session repo pubkey; bump clang/llvm versions
+  * Disable clang 21 for now; upgrade clang-17 to 19
+  * fix fmt linking
+  * Improve liblogging loading and handling
+  * circumvent compiler narrowing conversion warnings
+  * Prune unneeded things from the gnutls priority string
+  * Add oxen::quic cmake alias
+  * oxenc 1.6.0
+  * Fix crash if conn has gone away
+  * Expose stream stats
+  * Add comments for the internal stream state tracking variables
+  * Replace no-mtu-discovery with mtu cap
+  * bump session-deps to latest for build fixes
+
+  [ Thomas Winget ]
+  * Adds a separate JobQueue to Loop
+  * Add test for JobQueue
+  * add tests for multiple loop job queues
+  * version bump for new job queueing
+  * minor comment fixes
+  * Enforce owner of ticker/wakeable responsibility to destroy them
+  * Move Ticker and Wakeable creation back to Loop
+  * update some comments on Loop, JobQueue
+  * use event_add instead of oneshot for call_later
+  * Make Endpoint have its own JobQueue
+  * clang format
+  * Add JobQueue destruction safety to call_get
+  * change try/catch test to require throw
+  * fix jobqueue test and throw on call after stop
+  * defer lock, woops
+  * add queued datagram bytes limit
+  * add more verbose speed logging to speedtest server
+  * Datagram queue limit: 2MB default, drop counter, and test
+  * opt::enable_datagrams::queue_limit uses optional<size_t>
+  * format
+
+ -- Jason Rhinelander <jason@session.foundation>  Fri, 10 Jul 2026 18:37:17 -0300
+
 oxen-libquic (1.7.1-1) unstable; urgency=medium
 
   * Fix backwards time logic
