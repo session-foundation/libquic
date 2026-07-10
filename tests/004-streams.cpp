@@ -256,21 +256,20 @@ namespace oxen::quic::test
         Network test_net{};
         constexpr auto msg = "hello from the other siiiii-iiiiide"sv;
 
-        std::promise<void> ss_p, sc_p, cs_p, cc_p;
-        std::future<void> ss_f = ss_p.get_future(), sc_f = sc_p.get_future(), cs_f = cs_p.get_future(),
-                          cc_f = cc_p.get_future();
+        std::promise<bool> ss_p, cs_p;
+        std::promise<void> sc_p, cc_p;
+        std::future<bool> ss_f = ss_p.get_future(), cs_f = cs_p.get_future();
+        std::future<void> sc_f = sc_p.get_future(), cc_f = cc_p.get_future();
 
         stream_data_callback standard_server_cb = [&](Stream& s, std::span<const std::byte> dat) {
             log::debug(test_cat, "Calling standard stream data callback... data received...");
-            REQUIRE(view(dat) == msg);
-            ss_p.set_value();
+            ss_p.set_value(view(dat) == msg);
             s.send(msg, nullptr);
         };
 
         stream_data_callback standard_client_cb = [&](Stream& s, std::span<const std::byte> dat) {
             log::debug(test_cat, "Calling standard stream data callback... data received...");
-            REQUIRE(view(dat) == msg);
-            cs_p.set_value();
+            cs_p.set_value(view(dat) == msg);
             s.send(msg, nullptr);
         };
 
@@ -293,6 +292,7 @@ namespace oxen::quic::test
 
         require_future(ss_f);
         require_future(cc_f);
+        CHECK(ss_f.get());
 
         auto server_ci = server_endpoint->get_all_conns(Direction::INBOUND).front();
         auto server_stream = server_ci->open_stream<ServerStream>(std::move(sc_p));
@@ -301,6 +301,7 @@ namespace oxen::quic::test
 
         require_future(cs_f);
         require_future(sc_f);
+        CHECK(cs_f.get());
     }
 
     TEST_CASE("004 - Subclassing quic::stream, custom to custom", "[004][customstream][subclass]")

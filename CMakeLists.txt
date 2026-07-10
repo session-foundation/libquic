@@ -17,7 +17,7 @@ if(CCACHE_PROGRAM)
 endif()
 
 project(libquic
-    VERSION 1.7.1
+    VERSION 1.8.0
     DESCRIPTION "Modular QUIC library for stream and connection management"
     LANGUAGES ${LANGS})
 
@@ -28,7 +28,6 @@ else()
 endif()
 
 option(BUILD_SHARED_LIBS "Build as shared library" OFF)
-option(BUILD_STATIC_DEPS "Download, build, and statically link against core dependencies" OFF)
 option(WARNINGS_AS_ERRORS "treat all warnings as errors. turn off for development, on for release" OFF)
 option(LIBQUIC_WARN_DEPRECATED "warn deprecated" ON)
 option(LIBQUIC_BUILD_TESTS "Build libquic test suite" ${libquic_IS_TOPLEVEL_PROJECT})
@@ -48,6 +47,8 @@ option(LIBQUIC_INSTALL "Add quic libraries/headers/programs to cmake install tar
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+include(cmake/session-deps/Deps.cmake)
 
 set(default_lto ON)
 if(WIN32 OR BUILD_STATIC_DEPS)
@@ -75,10 +76,6 @@ if(IPO_ENABLED AND NOT DEFINED CMAKE_INTERPROCEDURAL_OPTIMIZATION)
 endif()
 
 include(GNUInstallDirs)
-
-if(BUILD_STATIC_DEPS)
-  include(cmake/StaticBuild.cmake)
-endif()
 
 # Interface target for any general includes, flags, etc. that is meant to be inherited publicly.
 add_library(libquic_external INTERFACE)
@@ -139,6 +136,8 @@ add_subdirectory(src)
 if(LIBQUIC_BUILD_TESTS OR LIBQUIC_BUILD_SPEEDTEST)
     add_subdirectory(tests)
 endif()
+
+add_library(oxen::quic ALIAS quic)
 
 if(LIBQUIC_INSTALL)
     install(

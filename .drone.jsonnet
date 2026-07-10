@@ -97,7 +97,7 @@ local debian_pipeline(name,
                       jobs=6,
                       tests=true,
                       test_0rtt=true,
-                      oxen_repo=false,
+                      session_repo=false,
                       allow_fail=false) = {
   kind: 'pipeline',
   type: 'docker',
@@ -117,10 +117,10 @@ local debian_pipeline(name,
                   apt_get_quiet + ' update',
                   apt_get_quiet + ' install -y eatmydata',
                 ] + (
-                  if oxen_repo then [
+                  if session_repo then [
                     'eatmydata ' + apt_get_quiet + ' install --no-install-recommends -y lsb-release',
-                    'cp utils/deb.oxen.io.gpg /etc/apt/trusted.gpg.d',
-                    'echo deb http://deb.oxen.io $$(lsb_release -sc) main >/etc/apt/sources.list.d/oxen.list',
+                    'cp utils/deb.session.foundation.gpg /etc/apt/trusted.gpg.d',
+                    'echo deb http://deb.session.foundation $$(lsb_release -sc) main >/etc/apt/sources.list.d/session.list',
                     'eatmydata ' + apt_get_quiet + ' update',
                   ] else []
                 ) + extra_setup
@@ -309,10 +309,10 @@ local mac_builder(name,
   // Various debian builds
   debian_pipeline('Debian sid', docker_base + 'debian-sid'),
   debian_pipeline('Debian sid/Debug', docker_base + 'debian-sid', build_type='Debug'),
-  clang(17),
-  full_llvm(17),
   clang(19),
   full_llvm(19),
+  //clang(21),
+  //full_llvm(21),
   debian_pipeline('Debian sid -GSO', docker_base + 'debian-sid', cmake_extra='-DLIBQUIC_SEND=sendmmsg'),
   debian_pipeline('Debian sid -mmsg', docker_base + 'debian-sid', cmake_extra='-DLIBQUIC_SEND=sendmsg -DLIBQUIC_RECVMMSG=OFF'),
   debian_pipeline('Debian sid -GSO/Debug', docker_base + 'debian-sid', build_type='Debug', cmake_extra='-DLIBQUIC_SEND=sendmmsg'),
@@ -323,9 +323,9 @@ local mac_builder(name,
   debian_pipeline('Debian 12', docker_base + 'debian-bookworm', extra_setup=debian_backports('bookworm', ['libngtcp2-dev', 'libngtcp2-crypto-gnutls-dev'])),
   debian_pipeline('Debian 12 static Debug', docker_base + 'debian-bookworm', build_type='Debug', cmake_extra='-DBUILD_STATIC_DEPS=ON', deps=['g++']),
   debian_pipeline('Ubuntu latest', docker_base + 'ubuntu-rolling'),
-  debian_pipeline('Ubuntu 24.04 noble', docker_base + 'ubuntu-jammy', oxen_repo=true),
-  debian_pipeline('Ubuntu 22.04 jammy', docker_base + 'ubuntu-jammy', oxen_repo=true),
-  debian_pipeline('Ubuntu 20.04 focal', docker_base + 'ubuntu-focal', deps=['g++-10'] + default_deps_old, extra_setup=kitware_repo('focal'), cmake_extra='-DCMAKE_C_COMPILER=gcc-10 -DCMAKE_CXX_COMPILER=g++-10', oxen_repo=true),
+  debian_pipeline('Ubuntu 24.04 noble', docker_base + 'ubuntu-jammy', session_repo=true),
+  debian_pipeline('Ubuntu 22.04 jammy', docker_base + 'ubuntu-jammy', session_repo=true),
+  debian_pipeline('Ubuntu 20.04 focal', docker_base + 'ubuntu-focal', deps=['g++-10'] + default_deps_old, extra_setup=kitware_repo('focal'), cmake_extra='-DCMAKE_C_COMPILER=gcc-10 -DCMAKE_CXX_COMPILER=g++-10', session_repo=true),
 
   // ARM builds (ARM64 and armhf)
   debian_pipeline('Debian sid (ARM64)', docker_base + 'debian-sid', arch='arm64', jobs=4),
