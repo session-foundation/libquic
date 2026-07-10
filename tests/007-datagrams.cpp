@@ -620,4 +620,80 @@ namespace oxen::quic::test
 #endif
         );
     }
+    TEST_CASE("007 - Datagram support: Queue limit drops excess datagrams", "[007][datagrams][queue_limit]")
+    {
+        auto client_established = callback_waiter{[](Connection&) {}};
+
+        Network test_net{};
+
+        // Small enough that sending a handful of ~500B datagrams will blow past it.
+        constexpr size_t queue_limit = 1000;
+
+        // Fires once the server has received at least one datagram, confirming that the queue
+        // drained between the two burst batches below.
+        std::promise<void> server_received_some;
+        std::atomic<bool> received_promise_set{false};
+        dgram_data_callback server_recv_cb = [&](datagram) {
+            if (!received_promise_set.exchange(true))
+                server_received_some.set_value();
+        };
+
+        opt::enable_datagrams dgram_opt{};
+        dgram_opt.queue_limit(queue_limit);
+
+        Address server_local{};
+        Address client_local{};
+
+        auto [client_tls, server_tls] = defaults::tls_creds_from_ed_keys();
+
+        auto server_endpoint = test_net.endpoint(server_local, dgram_opt);
+        REQUIRE_NOTHROW(server_endpoint->listen(server_tls, server_recv_cb));
+
+        RemoteAddress client_remote{defaults::SERVER_PUBKEY, LOCALHOST, server_endpoint->local().port()};
+
+        auto client_endpoint = test_net.endpoint(client_local, dgram_opt, client_established);
+        auto conn_interface = client_endpoint->connect(client_remote, client_tls);
+
+        REQUIRE(client_established.wait());
+
+        std::this_thread::sleep_for(5ms);
+
+        // Each payload is slightly over half the limit, so the third one will be dropped; 10
+        // sends guarantees we see several drops.
+        std::vector<std::byte> payload(queue_limit / 2 + 1, std::byte{0xab});
+
+        auto batch_send = [&] {
+            // Send the whole batch atomically on the loop thread so every enqueue happens before
+            // flush_packets() can drain any of them.
+            std::promise<void> sent;
+            test_net.loop()->call([&, dgrams = conn_interface->datagrams()]() {
+                for (int i = 0; i < 10; ++i)
+                    dgrams->send(payload, nullptr);
+                sent.set_value();
+            });
+            require_future(sent.get_future());
+        };
+
+        // First burst: queue fills and some datagrams are dropped.
+        batch_send();
+
+        auto drop_count =
+                test_net.loop()->call_get([&] { return TestHelper::get_dgram_drop_count(*conn_interface->datagrams()); });
+
+        REQUIRE(drop_count > 0);
+
+        // Wait for the server to receive something, confirming the queue has drained and the
+        // connection is healthy before the second burst.
+        require_future(server_received_some.get_future());
+
+        // Second burst: drop count must increase again, confirming the limit is enforced
+        // continuously and not just on the first overflow.
+        batch_send();
+
+        auto drop_count_2 =
+                test_net.loop()->call_get([&] { return TestHelper::get_dgram_drop_count(*conn_interface->datagrams()); });
+
+        REQUIRE(drop_count_2 > drop_count);
+    }
+
 }  // namespace oxen::quic::test

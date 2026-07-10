@@ -152,7 +152,11 @@ namespace oxen::quic
     }
 
     static constexpr auto* PRIORITY =
-            "NORMAL:+ECDHE-PSK:+PSK:+ECDHE-ECDSA:+AES-128-CCM-8:+CTYPE-CLI-ALL:+CTYPE-SRV-ALL:+SHA256";
+            "NORMAL"                                   // sane defaults
+            ":+VERS-TLS1.3"                            // Required by QUIC protocol
+            ":-VERS-TLS1.2:-VERS-TLS1.1:-VERS-TLS1.0"  // old TLS not needed or wanted
+            ":+CTYPE-CLI-ALL:+CTYPE-SRV-ALL"           // allows our raw pk certificate handling
+            ;
 
     GNUTLSCreds::GNUTLSCreds()
     {

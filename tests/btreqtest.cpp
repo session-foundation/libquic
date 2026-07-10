@@ -24,12 +24,16 @@ int main(int argc, char* argv[])
     std::string alpn;
     cli.add_option("-a,--alpn", alpn, "Client ALPN to use when negotiating the connection")->required();
 
-    std::vector<std::string> commands;
-    cli.add_option("commands", commands, "Pairs of endpoint and body values to send.  Each pair makes one request")
-            ->required()
-            ->expected(2, -1);
+    bool unauthenticated = false;
+    cli.add_flag(
+            "-U,--unauthenticated",
+            unauthenticated,
+            "Connect without any client authentication.  Without this, a randomly generated key is used for client-side "
+            "keypair.");
 
-    std::string log_file, log_level;
+    cli.allow_extras();
+
+    std::string log_file, log_level = "warning;quic-test=info";
     add_log_opts(cli, log_file, log_level);
 
     try
@@ -41,9 +45,11 @@ int main(int argc, char* argv[])
         return cli.exit(e);
     }
 
-    if (commands.size() % 2)
+    std::vector<std::string> commands = cli.remaining();
+    if (commands.empty() || commands.size() % 2)
     {
-        std::cerr << "Invalid commands: expected even number of command/body pairs\n";
+        std::cerr << (commands.empty() ? "No commands given" : "Invalid number of CMD BODY arguments")
+                  << ".  Usage: " << argv[0] << " [options...] CMD BODY [CMD2 BODY2 ...]\n";
         return 1;
     }
 
@@ -51,8 +57,15 @@ int main(int argc, char* argv[])
 
     Loop loop;
 
-    auto [seed, pubkey] = generate_ed25519();
-    auto client_tls = GNUTLSCreds::make_from_ed_keys(seed, pubkey);
+    std::shared_ptr<GNUTLSCreds> client_tls;
+    if (unauthenticated)
+        client_tls = GNUTLSCreds::make_unauthenticated();
+    else
+    {
+        auto [seed, pubkey] = generate_ed25519();
+        client_tls = GNUTLSCreds::make_from_ed_keys(seed, pubkey);
+    }
+
     if (enable_0rtt)
         zerortt_storage::enable(*client_tls, zerortt_path);
 
@@ -63,21 +76,54 @@ int main(int argc, char* argv[])
     RemoteAddress server_addr{remote_pubkey, Address::parse(remote_addr)};
 
     log::debug(test_cat, "Constructing endpoint on {}", client_local);
-    std::optional<opt::disable_mtu_discovery> mtu;
+    std::optional<opt::max_udp_payload> mtu;
     if (disable_pmtud)
-        mtu.emplace();
+        mtu.emplace(opt::max_udp_payload::minimum());
 
     auto client =
             Endpoint::endpoint(loop, client_local, generate_static_secret(seed_string), opt::outbound_alpns{{alpn}}, mtu);
     log::info(test_cat, "Connecting to {}...", server_addr);
-    auto conn = client->connect(server_addr, client_tls);
+    std::atomic<bool> failed = false;
+    std::promise<void> connected;
+    auto conn = client->connect(
+            server_addr,
+            client_tls,
+            [&](Connection&) {
+                log::info(test_cat, "Connection established");
+                connected.set_value();
+            },
+            [&](Connection&, uint64_t errcode) {
+                if (errcode)
+                {
+                    log::error(test_cat, "Connection failed (ec={})", errcode);
+                    failed = true;
+                }
+                else
+                    log::info(test_cat, "Connection closed.");
+            });
+
+    connected.get_future().get();
 
     auto s = conn->open_stream<BTRequestStream>();
 
-    for (auto it = commands.begin(); it != commands.end();)
+    for (auto it = commands.begin(); it != commands.end() && !failed;)
     {
         const auto& ep = *it++;
         const auto& body = *it++;
+
+        if (ep == "sleep")
+        {
+            int sleep_seconds;
+            if (auto [ptr, ec] = std::from_chars(body.data(), body.data() + body.size(), sleep_seconds); ec != std::errc{})
+            {
+                std::cerr << "Invalid 'sleep' pseudo-command: usage:  sleep SECONDS\n";
+                return 1;
+            }
+            log::info(test_cat, "Sleeping for {}s", sleep_seconds);
+            std::this_thread::sleep_for(sleep_seconds * 1s);
+            continue;
+        }
+
         log::info(test_cat, "Sending {} request...", ep);
         auto sent = std::chrono::steady_clock::now();
         std::promise<void> prom;
@@ -87,7 +133,7 @@ int main(int argc, char* argv[])
             if (m)
             {
                 log::info(test_cat, "Received {}-byte {} response in {:.3f}s", m.body().size(), ep, elapsed);
-                std::cout << m.body();
+                std::cout << m.body() << "\n";
             }
             else if (m.timed_out)
                 log::warning(test_cat, "Request {} timed out in {:.3f}s", ep, elapsed);
