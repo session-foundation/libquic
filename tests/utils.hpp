@@ -80,6 +80,7 @@ namespace oxen::quic
         static int get_dgram_debug_counter(Connection& conn);
 
         static int get_datagram_last_cleared(Datagrams& dg);
+        static size_t get_dgram_drop_count(Datagrams& dg);
 
         // Bumps the connection's next reference id to make it easier to tell which connection is
         // which in log output.
@@ -266,6 +267,8 @@ namespace oxen::quic
                 return func(std::forward<decltype(args)>(args)...);
             };
         }
+
+        void call() { this->operator Func_t()(); }
     };
 
     /// Waits for some condition to be satisfied, sleeping between checks.  Returns the result of
@@ -360,7 +363,8 @@ namespace oxen::quic
     // loop and is not meant to be particularly performant.
     //
     // To use this you must:
-    // - construct this object via `auto delayer = packet_delayer::make(10ms);`
+    // - construct this object via `auto delayer = packet_delayer::make(10ms);`.  You generally want
+    //   this to outlast the loop (i.e. declare it earlier) to avoid destruction issues.
     // - construct the endpoint, passing `*delayer` to the `endpoint(...)` call (this object
     //   auto-converts into the appropriate manual routing option).
     // - call `delayer->init(ep)`, providing the endpoint which starts the actual underlying socket,
@@ -371,7 +375,7 @@ namespace oxen::quic
         std::atomic<std::chrono::milliseconds> delay;
 
       private:
-        std::shared_ptr<Endpoint> ep;
+        std::weak_ptr<Endpoint> ep;
         std::unique_ptr<UDPSocket> sock;
         std::deque<std::tuple<int64_t, Path, std::vector<std::byte>>> outgoing;
         std::deque<std::pair<int64_t, Packet>> incoming;
