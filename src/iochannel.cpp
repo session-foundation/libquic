@@ -15,7 +15,7 @@ namespace oxen::quic
 
     std::shared_ptr<Connection> IOChannel::get_conn()
     {
-        return loop.call_get([this] { return _conn ? _conn->shared_from_this() : nullptr; });
+        return endpoint.job_queue.call_get([this] { return _conn ? _conn->shared_from_this() : nullptr; });
     }
 
     void IOChannel::send(std::string&& data)
