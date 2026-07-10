@@ -169,7 +169,7 @@ namespace oxen::quic
 
     void BTRequestStream::register_handler(std::string ep, std::function<void(message)> func)
     {
-        loop.call([this, ep = std::move(ep), func = std::move(func)]() mutable {
+        endpoint.job_queue.call([this, ep = std::move(ep), func = std::move(func)]() mutable {
             registered_endpoints[std::move(ep)] = std::move(func);
         });
     }
@@ -177,7 +177,7 @@ namespace oxen::quic
     void BTRequestStream::register_generic_handler(std::function<void(message)> request_handler)
     {
         log::debug(log_cat, "BTRequestStream set generic request handler");
-        loop.call([this, func = std::move(request_handler)]() mutable { generic_handler = std::move(func); });
+        endpoint.job_queue.call([this, func = std::move(request_handler)]() mutable { generic_handler = std::move(func); });
     }
 
     void BTRequestStream::handle_input(message msg)

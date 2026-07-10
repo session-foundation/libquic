@@ -1,5 +1,6 @@
 #include "utils.hpp"
 
+#include <oxen/log/level.hpp>
 #include <oxen/quic/connection.hpp>
 #include <oxen/quic/endpoint.hpp>
 #include <oxen/quic/loop.hpp>
@@ -135,6 +136,11 @@ namespace oxen::quic
         return dg.recv_buffer.last_cleared;
     }
 
+    size_t TestHelper::get_dgram_drop_count(Datagrams& dg)
+    {
+        return dg.dgram_drop_count;
+    }
+
     void TestHelper::increment_ref_id(Endpoint& ep, uint64_t by)
     {
         ep._next_rid += by;
@@ -228,8 +234,10 @@ namespace oxen::quic
 
     void add_log_opts(CLI::App& cli, std::string& file, std::string& level)
     {
-        file = "stderr";
-        level = "warning";
+        if (file.empty())
+            file = "stderr";
+        if (level.empty())
+            level = "warning";
 
         cli.add_option("-l,--log-file", file, "Log output filename, or one of stdout/-/stderr/syslog.")
                 ->type_name("FILE")
@@ -237,8 +245,7 @@ namespace oxen::quic
 
         cli.add_option("-L,--log-level", level, "Log verbosity level; one of trace, debug, info, warn, error, critical, off")
                 ->type_name("LEVEL")
-                ->capture_default_str()
-                ->check(CLI::IsMember({"trace", "debug", "info", "warn", "error", "critical", "off"}));
+                ->capture_default_str();
     }
 
     void common_server_opts(
@@ -284,11 +291,12 @@ namespace oxen::quic
         if (store_0rtt.empty())
             store_0rtt = std::filesystem::path{u8"./libquic-test-0rtt-cache.bin"};
 
-        cli.add_option("-R,--remote", remote_addr, "Remote address to connect to")
-                ->type_name("IP:PORT")
-                ->capture_default_str()
-                ->check([](const std::string& val) { return val.empty() ? "address cannot be empty" : ""; })
-                ->force_callback();
+        auto rem = cli.add_option("-R,--remote", remote_addr, "Remote address to connect to")
+                           ->type_name("IP:PORT")
+                           ->required()
+                           ->check([](const std::string& val) { return val.empty() ? "address cannot be empty" : ""; });
+        if (!remote_addr.empty())
+            rem->capture_default_str();
 
         auto* rem_pubkey = cli.add_option_group("remote pubkey");
         rem_pubkey->add_option("-P,--remote-pubkey", remote_pubkey, "Remote server pubkey")
@@ -364,8 +372,6 @@ namespace oxen::quic
 
     void setup_logging(std::string out, const std::string& level)
     {
-        log::Level lvl = log::level_from_string(level);
-
         constexpr std::array print_vals = {"stdout", "-", "", "stderr", "nocolor", "stdout-nocolor", "stderr-nocolor"};
         log::Type type;
         if (std::count(print_vals.begin(), print_vals.end(), out))
@@ -376,9 +382,9 @@ namespace oxen::quic
             type = log::Type::File;
 
         oxen::log::add_sink(type, out, "[%T.%f] [%*] [\x1b[1m%n\x1b[0m:%^%l%$|\x1b[3m%g:%#\x1b[0m] %v");
-        oxen::log::reset_level(lvl);
+        oxen::log::apply_categories(level);
 
-        if (lvl <= oxen::log::Level::trace)
+        if (oxen::log::get_level("gnutls") <= oxen::log::Level::trace)
             enable_gnutls_logging();
     }
 
@@ -561,28 +567,35 @@ namespace oxen::quic
 
     void packet_delayer::init(std::shared_ptr<Endpoint> ep_)
     {
-        if (ep)
+        if (ep.use_count())
             throw std::logic_error{"Cannot call packet_delayer::init more than once"};
-        ep = std::move(ep_);
-        if (!ep)
+        if (!ep_)
             throw std::logic_error{"packet_delayer::init called with nullptr endpoint"};
 
+        ep = ep_;
+
         sock = std::make_unique<UDPSocket>(
-                ep->loop.get_event_base(), ep->local(), false, [wself = weak_from_this()](Packet&& pkt) {
+                ep_->loop.get_event_base(), ep_->local(), false, [wself = weak_from_this()](Packet&& pkt) {
                     log::debug(log_cat, "incoming {}B udp packet from {}; delaying delivery", pkt.size(), pkt.path);
                     auto sself = wself.lock();
                     if (!sself)
                         return;
                     auto& self = *sself;
+                    auto ep = self.ep.lock();
+                    if (!ep)
+                        return;
 
                     pkt.ensure_owned_data();
                     self.incoming.emplace_back(++self.in_id, std::move(pkt));
 
-                    self.ep->loop.call_later(self.delay.load(), [wself, id = self.in_id] {
+                    ep->loop.call_later(self.delay.load(), [wself, id = self.in_id] {
                         auto sself = wself.lock();
                         if (!sself)
                             return;
                         auto& self = *sself;
+                        auto ep = self.ep.lock();
+                        if (!ep)
+                            return;
 
                         // Process all packets <= out id to ensure delivery order (see extended comment below)
                         while (!self.incoming.empty())
@@ -595,12 +608,12 @@ namespace oxen::quic
                                     "completing incoming delayed delivery of {}B packet on path {}",
                                     pkt.size(),
                                     pkt.path);
-                            self.ep->manually_receive_packet(std::move(pkt));
+                            ep->manually_receive_packet(std::move(pkt));
                             self.incoming.pop_front();
                         }
                     });
                 });
-        ep->set_local(sock->address());
+        ep_->set_local(sock->address());
     }
 
     packet_delayer::operator opt::manual_routing()
@@ -610,13 +623,11 @@ namespace oxen::quic
             if (!sself)
                 return;
             auto& self = *sself;
-            if (!self.ep)
-            {
-                log::critical(log_cat, "Error: packet_delayer received packet without a call to init()");
+            auto ep = self.ep.lock();
+            if (!ep)
                 return;
-            }
             self.outgoing.emplace_back(++self.out_id, p, std::vector(pkt.begin(), pkt.end()));
-            self.ep->loop.call_later(self.delay.load(), [wself, id = self.out_id] {
+            ep->loop.call_later(self.delay.load(), [wself, id = self.out_id] {
                 auto sself = wself.lock();
                 if (!sself)
                     return;

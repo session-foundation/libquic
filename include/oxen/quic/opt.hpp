@@ -13,10 +13,37 @@ namespace oxen::quic
     {
         using namespace std::chrono_literals;
 
-        // It appears that sometimes the MTU on a path decreases, causing packets to fail
-        // because the discovered MTU is now too high.  Passing this opt disables path MTU discovery.
-        struct disable_mtu_discovery
-        {};
+        // Caps the maximum QUIC packet size (i.e. the UDP payload) that path MTU discovery will
+        // probe up to.  PMTUD still runs normally, probing upward from the 1200-byte QUIC
+        // minimum, but will never exceed this value.  Setting this to 1200 effectively disables
+        // PMTUD since there is nowhere to probe.
+        //
+        // The value is the maximum UDP payload size, NOT the link-layer MTU.  Use the ipv4()
+        // or ipv6() factories to convert from a link MTU.  Must be at least 1200.
+        struct max_udp_payload
+        {
+            size_t size;
+            explicit max_udp_payload(size_t s) : size{s}
+            {
+                if (s < 1200)
+                    throw std::invalid_argument{"max_udp_payload size must be at least 1200"};
+            }
+
+            // The QUIC minimum (1200); effectively disables PMTUD.
+            static max_udp_payload minimum() { return max_udp_payload{1200}; }
+
+            // Constructs from an IPv4 link MTU by subtracting 28 bytes (20 IP + 8 UDP).
+            static max_udp_payload ipv4(size_t link_mtu) { return max_udp_payload{link_mtu - 28}; }
+
+            // Constructs from an IPv6 link MTU by subtracting 48 bytes (40 IP + 8 UDP).
+            static max_udp_payload ipv6(size_t link_mtu) { return max_udp_payload{link_mtu - 48}; }
+        };
+
+        // Deprecated: use max_udp_payload::minimum() instead.
+        struct [[deprecated("use max_udp_payload::minimum() instead")]] disable_mtu_discovery : max_udp_payload
+        {
+            disable_mtu_discovery() : max_udp_payload{1200} {}
+        };
 
         // Allow GSO to be used when sending packets, if supported by the OS (currently only ever
         // allowed on Linux).  As this is somewhat dependent on hardware/software, it is disabled by
@@ -133,13 +160,20 @@ namespace oxen::quic
             Splitting mode{Splitting::NONE};
             // Note: this is the size of the entire buffer, divided amongst 4 rows
             int bufsize{4096};
-            size_t dgram_queue_limit{std::numeric_limits<size_t>::max()};
+            std::optional<size_t> dgram_queue_limit{std::nullopt};
 
+            // Sets the maximum number of bytes that may be queued for sending on a single
+            // connection's datagram channel.  When the limit is exceeded, incoming datagrams are
+            // silently dropped until the queue drains below the limit again.  A drop counter is
+            // maintained in the connection's Datagrams object for diagnostics.  Pass 0 for
+            // unlimited (not recommended: an unbounded queue can cause severe congestion issues).
+            // If not called, the connection uses its own default.
             enable_datagrams& queue_limit(size_t limit)
             {
                 if (limit == 0)
-                    limit = std::numeric_limits<size_t>::max();
-                dgram_queue_limit = limit;
+                    dgram_queue_limit = std::numeric_limits<size_t>::max();
+                else
+                    dgram_queue_limit = limit;
                 return *this;
             }
 

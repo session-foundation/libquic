@@ -329,6 +329,7 @@ namespace oxen::quic
       protected:
         friend class Connection;
         friend class Loop;
+        friend class JobQueue;
         friend struct dgram::rotating_buffer;
         friend class TestHelper;
 
@@ -345,8 +346,10 @@ namespace oxen::quic
 
         dgram_data_callback dgram_data_cb;
 
-        // Maximum datagram size queued per connection.  Will need tuning.
-        size_t dgram_queue_limit = std::numeric_limits<size_t>::max();
+        // Maximum bytes queued for sending per connection; see opt::enable_datagrams::queue_limit().
+        size_t dgram_queue_limit = 2'000'000;
+        // Counts datagrams dropped due to queue limit; logged at debug on the 1st and every 100th drop.
+        size_t dgram_drop_count = 0;
 
         /// Datagram Numbering:
         /// Each datagram ID is comprised of a 16 bit quantity consisting of a 14 bit counter, and
