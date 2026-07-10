@@ -42,7 +42,7 @@ namespace oxen::quic
         _packet_splitting = dc.split_packets;
         _policy = dc.mode;
         _rbufsize = dc.bufsize;
-        _dgram_queue_limit = dc.dgram_queue_limit;
+        _dgram_queue_limit = dc.dgram_queue_limit.value_or(0);
 
         log::trace(
                 log_cat,
@@ -100,9 +100,9 @@ namespace oxen::quic
         _manual_routing = std::move(mrouting);
     }
 
-    void Endpoint::handle_ep_opt([[maybe_unused]] opt::disable_mtu_discovery)
+    void Endpoint::handle_ep_opt(opt::max_udp_payload mup)
     {
-        _disable_mtu_discovery = true;
+        _max_udp_payload = mup.size;
     }
 
     void Endpoint::handle_ep_opt([[maybe_unused]] opt::allow_gso)
@@ -113,7 +113,7 @@ namespace oxen::quic
     ConnectionID Endpoint::next_reference_id()
     {
         log::trace(log_cat, "{} called", __PRETTY_FUNCTION__);
-        assert(loop.inside());
+        assert(job_queue.inside());
         return ConnectionID{++_next_rid};
     }
 
@@ -127,11 +127,11 @@ namespace oxen::quic
 
     void Endpoint::manually_receive_packet(Packet&& pkt)
     {
-        if (loop.inside())
+        if (job_queue.inside())
             return handle_packet(std::move(pkt));
 
         pkt.ensure_owned_data();
-        loop.call_soon([this, packet = std::move(pkt)]() mutable { handle_packet(std::move(packet)); });
+        job_queue.call_soon([this, packet = std::move(pkt)]() mutable { handle_packet(std::move(packet)); });
     }
 
     void Endpoint::_init_internals()
@@ -186,7 +186,7 @@ namespace oxen::quic
                             nullptr,
                             std::nullopt,
                             nullptr,
-                            _disable_mtu_discovery);
+                            _max_udp_payload);
                     return it_b->second;
                 }
                 catch (...)
@@ -229,7 +229,7 @@ namespace oxen::quic
     {
         // We need to defer this because we aren't allowed to close connections during some other
         // callback, and can't guarantee we aren't in such a callback.
-        loop.call_soon([wself = weak_from_this(), d] {
+        job_queue.call_soon([wself = weak_from_this(), d] {
             if (auto self = wself.lock())
                 self->_close_conns(d);
         });
@@ -250,7 +250,7 @@ namespace oxen::quic
 
     Endpoint::~Endpoint()
     {
-        assert(loop.inside());
+        assert(job_queue.inside());
         _close_conns(std::nullopt);
 
         // Close it here rather than via member destruction because it still owns a callback that
@@ -260,7 +260,7 @@ namespace oxen::quic
 
     void Endpoint::schedule_conn_cleanup(Connection& conn)
     {
-        loop.call_later(
+        job_queue.call_later(
                 std::chrono::microseconds{(ngtcp2_conn_get_pto(conn) * 3 + 999) / 1000},
                 [this, wself = weak_from_this(), cid = conn.reference_id()] {
                     auto self = wself.lock();
@@ -367,7 +367,7 @@ namespace oxen::quic
     void Endpoint::drop_connection(Connection& conn, io_error err)
     {
         log::debug(log_cat, "Scheduling drop connection ({}) with errcode {}", conn.reference_id(), err.code());
-        loop.call_soon([wself = weak_from_this(), &conn, err] {
+        job_queue.call_soon([wself = weak_from_this(), &conn, err] {
             if (auto self = wself.lock())
                 self->_drop_connection(conn, err);
         });
@@ -377,10 +377,10 @@ namespace oxen::quic
     {
         if (!msg)
             msg = ec.strerror();
-        loop.call_soon([wself = weak_from_this(),
-                        connid = conn.reference_id(),
-                        ec = std::move(ec),
-                        msg = std::move(*msg)]() mutable {
+        job_queue.call_soon([wself = weak_from_this(),
+                             connid = conn.reference_id(),
+                             ec = std::move(ec),
+                             msg = std::move(*msg)]() mutable {
             if (auto self = wself.lock())
                 if (auto it = self->conns.find(connid); it != self->conns.end() && it->second)
                     self->_close_connection(*it->second, std::move(ec), std::move(msg));
@@ -426,7 +426,7 @@ namespace oxen::quic
     {
         log::debug(log_cat, "Closing connection ({})", conn.reference_id());
 
-        assert(loop.inside());
+        assert(job_queue.inside());
 
         if (conn.is_closing() || conn.is_draining())
             return;
@@ -532,7 +532,7 @@ namespace oxen::quic
             // Defer destruction until the next event loop tick because there are code paths that
             // can land here from within an ongoing connection method and so it isn't safe to allow
             // the Connection to get destroyed right now.
-            loop.reset_soon(std::move(it->second));
+            job_queue.reset_soon(std::move(it->second));
             // We do want to remove it from `conns`, though, because some scheduled callbacks check
             // for `rid` being still in the endpoint and so, in that respect, we want the connection
             // to be considered gone even if its destructor doesn't fire yet.
@@ -544,7 +544,7 @@ namespace oxen::quic
     void Endpoint::initial_association(Connection& conn)
     {
         log::trace(log_cat, "{} called", __PRETTY_FUNCTION__);
-        assert(loop.inside());
+        assert(job_queue.inside());
 
         auto dir_str = conn.is_outbound() ? "CLIENT"s : "SERVER"s;
         auto n = ngtcp2_conn_get_scid(conn, nullptr);
@@ -568,7 +568,7 @@ namespace oxen::quic
 
     void Endpoint::associate_reset(const uint8_t* token, Connection& conn)
     {
-        assert(loop.inside());
+        assert(job_queue.inside());
         if (!token)
         {
             log::debug(log_cat, "Cannot add a null reset token");
@@ -585,7 +585,7 @@ namespace oxen::quic
 
     void Endpoint::dissociate_reset(const uint8_t* token, Connection& conn)
     {
-        assert(loop.inside());
+        assert(job_queue.inside());
         if (!token)
             return;
 
@@ -614,7 +614,7 @@ namespace oxen::quic
 
     void Endpoint::associate_cid(const quic_cid& qcid, Connection& conn, bool weakly)
     {
-        assert(loop.inside());
+        assert(job_queue.inside());
         log::trace(
                 log_cat, "{} associating CID:{} to {}", conn.is_inbound() ? "SERVER" : "CLIENT", qcid, conn.reference_id());
 
@@ -625,14 +625,14 @@ namespace oxen::quic
 
     void Endpoint::associate_cid(const ngtcp2_cid* cid, Connection& conn)
     {
-        assert(loop.inside());
+        assert(job_queue.inside());
         if (cid->datalen)
             return associate_cid(quic_cid{*cid}, conn);
     }
 
     void Endpoint::dissociate_cid(const quic_cid& qcid, Connection& conn)
     {
-        assert(loop.inside());
+        assert(job_queue.inside());
         log::trace(
                 log_cat, "{} dissociating CID:{} to {}", conn.is_inbound() ? "SERVER" : "CLIENT", qcid, conn.reference_id());
 
@@ -642,7 +642,7 @@ namespace oxen::quic
 
     void Endpoint::dissociate_cid(const ngtcp2_cid* cid, Connection& conn)
     {
-        assert(loop.inside());
+        assert(job_queue.inside());
         if (cid->datalen)
             return dissociate_cid(quic_cid{*cid}, conn);
     }
@@ -967,7 +967,7 @@ namespace oxen::quic
 
         log::debug(log_cat, "Constructing path using packet path: {}", pkt.path);
 
-        assert(loop.inside());
+        assert(job_queue.inside());
 
         auto next_rid = next_reference_id();
 
@@ -992,7 +992,7 @@ namespace oxen::quic
                             &hdr,
                             token_type,
                             pkt_original_cid,
-                            _disable_mtu_discovery);
+                            _max_udp_payload);
 
                     conn = it_b->second.get();
                     break;
