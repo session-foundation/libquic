@@ -303,9 +303,9 @@ int main(int argc, char* argv[])
     RemoteAddress server_addr{remote_pubkey, Address::parse(remote_addr, DEFAULT_SPEEDTEST_ADDR.port())};
 
     log::debug(test_cat, "Constructing endpoint on {}", client_local);
-    std::optional<opt::disable_mtu_discovery> mtu;
+    std::optional<opt::max_udp_payload> mtu;
     if (disable_pmtud)
-        mtu.emplace();
+        mtu.emplace(opt::max_udp_payload::minimum());
 
     auto client = Endpoint::endpoint(
             loop,
