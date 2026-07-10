@@ -49,7 +49,12 @@ namespace oxen::quic
         connection_established_callback connection_established_cb;
         connection_closed_callback connection_close_cb;
 
+        // Returns the max UDP payload cap configured on this endpoint, if any.  nullopt means
+        // PMTUD runs with the default maximum.
+        std::optional<size_t> get_max_udp_payload() const { return _max_udp_payload; }
+
         Loop& loop;
+        JobQueue job_queue{loop};
 
         template <typename... Opt>
         void listen(Opt&&... opts)
@@ -58,7 +63,7 @@ namespace oxen::quic
                     (0 + ... + std::is_convertible_v<std::remove_cvref_t<Opt>, std::shared_ptr<TLSCreds>>) == 1,
                     "listen() requires exactly one std::shared_ptr<TLSCreds> argument");
 
-            loop.call_get([&opts..., this]() {
+            job_queue.call_get([&opts..., this]() {
                 if (inbound_ctx)
                     throw std::logic_error{"Cannot call listen() more than once"};
 
@@ -82,7 +87,7 @@ namespace oxen::quic
             if (_local.is_ipv6() && !remote.is_ipv6())
                 remote.map_ipv4_as_ipv6();
 
-            return loop.call_get([this, &opts..., remote = std::move(remote)]() mutable {
+            return job_queue.call_get([this, &opts..., remote = std::move(remote)]() mutable {
                 // initialize client context and client tls context simultaneously
                 auto outbound_ctx = std::make_shared<IOContext>(Direction::OUTBOUND, std::forward<Opt>(opts)...);
                 _assign_context_globals(*outbound_ctx);
@@ -159,6 +164,7 @@ namespace oxen::quic
       private:
         friend class Network;
         friend class Loop;
+        friend class JobQueue;
         friend class Connection;
         friend struct connection_callbacks;
         friend class TestHelper;
@@ -182,7 +188,7 @@ namespace oxen::quic
         size_t _dgram_queue_limit{std::numeric_limits<size_t>::max()};
 
         opt::manual_routing _manual_routing;
-        bool _disable_mtu_discovery{false};
+        std::optional<size_t> _max_udp_payload;
         bool _allow_gso{false};
 
         uint64_t _next_rid{0};
@@ -214,7 +220,7 @@ namespace oxen::quic
         void handle_ep_opt(connection_closed_callback conn_closed_cb);
         void handle_ep_opt(opt::static_secret ssecret);
         void handle_ep_opt(opt::manual_routing mrouting);
-        void handle_ep_opt(opt::disable_mtu_discovery);
+        void handle_ep_opt(opt::max_udp_payload mup);
         void handle_ep_opt(opt::allow_gso);
 
         // Takes a std::optional-wrapped option that does nothing if the optional is empty,

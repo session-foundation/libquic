@@ -2,6 +2,11 @@ set(libquic_send_allowed "gso, sendmmsg, sendmsg")
 
 configure_file(version.cpp.in version.cpp @ONLY)
 
+session_dep(libngtcp2 1.1.0 WITH libngtcp2_crypto_gnutls)
+session_dep(gnutls 3.7.2)
+session_dep(nettle 3.5)
+session_dep(libevent_core 2.1 WITH libevent_pthreads)
+
 add_library(quic
     address.cpp
     btstream.cpp
@@ -25,16 +30,16 @@ add_library(quic
 
 target_link_libraries(quic
     PUBLIC
-    ngtcp2::crypto_gnutls
-    gnutls::gnutls
+    sessiondep::libngtcp2
+    sessiondep::libngtcp2_crypto_gnutls
+    sessiondep::gnutls
     oxen::logging
     libquic_external
-    oxenc
+    oxenc::oxenc
+    sessiondep::libevent_core sessiondep::libevent_pthreads
     PRIVATE
-    libevent::core
-    libevent::threads
     libquic_internal
-    nettle::nettle
+    sessiondep::nettle
 )
 
 target_compile_features(quic INTERFACE cxx_std_20)

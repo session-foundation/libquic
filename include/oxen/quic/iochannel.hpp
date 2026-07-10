@@ -121,7 +121,7 @@ namespace oxen::quic
                 typename EP = Endpoint>
         Ret call_get_accessor(T (Class::*getter)() const) const
         {
-            return static_cast<EP&>(endpoint).loop.call_get(
+            return static_cast<EP&>(endpoint).job_queue.call_get(
                     [this, &getter]() -> Ret { return (static_cast<const Class*>(this)->*getter)(); });
         }
     };

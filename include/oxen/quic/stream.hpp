@@ -67,6 +67,7 @@ namespace oxen::quic
         friend class Connection;
         friend class Network;
         friend class Loop;
+        friend class JobQueue;
 
       protected:
         template <typename... Opts>
@@ -175,6 +176,24 @@ namespace oxen::quic
          */
         void resume();
 
+        // Returns the total number of bytes that have been acknowledged by the remote end on this
+        // stream.  This value increases monotonically as data is acked.
+        uint64_t acked_bytes() const;
+
+        // Returns the number of bytes that have been sent on the wire but not yet acked.
+        size_t unacked_bytes() const;
+
+        // Returns a consistent snapshot of {acked, unacked, unsent} byte counts for the stream.
+        // This is equivalent to calling acked_bytes(), unacked_bytes(), and unsent() individually,
+        // but retrieves all three atomically in a single call.
+        // - acked: total bytes confirmed received by the remote (monotonically increasing)
+        // - unacked: bytes written into QUIC packets but not yet acked
+        // - unsent: bytes queued via send() but not yet written into QUIC packets
+        // Useful derived values:
+        // - acked + unacked + unsent = total bytes fed to the stream
+        // - acked + unacked = total bytes sent on the wire
+        std::tuple<uint64_t, size_t, size_t> get_stats() const;
+
         // Returns true if the stream is writeable, i.e. not closing, shutdown and FIN not sent or
         // scheduled.
         bool writable() const;
@@ -264,21 +283,45 @@ namespace oxen::quic
         // primary used by connection.cpp to obtain the next chunk of data from this stream.
         std::pair<std::vector<ngtcp2_vec>, bool> pending(size_t bytes);
 
+        // Bytes queued via send() but not yet written into QUIC packets
         size_t _unsent_size{0};
+        // Bytes written into QUIC packets but not yet acked by the remote
         size_t _unacked_size{0};
+        // Total bytes acked by the remote over the lifetime of the stream (monotonically increasing)
+        uint64_t _acked_bytes{0};
+        // Index into user_buffers of the next buffer to be sent (buffers before this are
+        // fully sent but possibly not yet acked)
         size_t _current_buffer_index{0};
+        // Byte offset within user_buffers[_current_buffer_index] of the next unsent byte
         size_t _current_buffer_offset{0};
+        // Sum of all buffer sizes currently in user_buffers (sent + unsent, not yet freed by acks)
         size_t _total_buffer_size{0};
+        // True once close() has been called on this stream
         bool _is_closing{false};
+        // True once send_fin() has been called (FIN queued but possibly not yet sent)
         bool _send_fin{false};
+        // True once the FIN bit has actually been written into a QUIC packet
         bool _sent_fin{false};
+        // True once a FIN has been received from the remote end
         bool _received_fin{false};
+        // True once the stream has been assigned an ID and can send data
         bool _ready{false};
+        // True when pause() has been called; suppresses extending the max stream data offset
+        // so that the remote's send window stops growing, applying backpressure
         bool _paused{false};
+        // Set via opt::stream_notify_t; causes an empty stream frame to be sent to notify the
+        // remote that this stream exists.  Cleared after the first write.
         bool _notify{false};
+        // Records that _notify was originally set, so it can be restored on 0-RTT revert
         bool _had_notify{false};
+        // QUIC stream ID (>= 0 for real streams).  -1 for the per-connection pseudo-stream,
+        // which carries no data and exists to give ngtcp2 an opportunity to produce packets
+        // when no streams have data to send (e.g. standalone ack packets, handshake
+        // completion).  -2 means not yet assigned (pending stream).
         int64_t _stream_id{-2};
 
+        // Accumulates max_stream_offset extensions that were suppressed while paused; applied
+        // in bulk when resume() is called
         size_t _paused_offset{0};
 
         stream_data_callback _data_callback;
@@ -294,10 +337,6 @@ namespace oxen::quic
 
         void check_watermark();
         void acknowledge(size_t bytes);
-
-        size_t size() const { return _total_buffer_size; }
-
-        size_t unacked() const { return _unacked_size; }
 
         // Implementations classes for send_chunks()
 

@@ -4,24 +4,15 @@ add_subdirectory(CLI11)
 
 
 add_library(tests_common STATIC utils.cpp)
-target_link_libraries(tests_common PUBLIC
-    quic CLI11::CLI11 libquic_internal-warnings gnutls::gnutls)
 
-macro(link_test_dep x)
-    string(TOUPPER "${x}" BIG_X)
-    if(TARGET ${x}::${x})
-        target_link_libraries(tests_common INTERFACE ${x}::${x})
-    else()
-        find_package(PkgConfig REQUIRED)
-        pkg_check_modules(${BIG_X} ${x} REQUIRED IMPORTED_TARGET)
-        target_link_libraries(tests_common INTERFACE PkgConfig::${BIG_X})
-    endif()
-endmacro()
 
 # We need hogweed for generating Ed25519 keys (this is already a gnutls dependency, so we
 # shouldn't be adding any new dep by requiring it)
-link_test_dep(hogweed)
-link_test_dep(nettle)
+session_dep(nettle 0 WITH hogweed)
+
+target_link_libraries(tests_common PUBLIC
+    quic CLI11::CLI11 libquic_internal-warnings sessiondep::gnutls sessiondep::hogweed sessiondep::nettle)
+
 
 function(extra_linking target)
     if(WIN32 AND NOT BUILD_SHARED_LIBS)
@@ -51,6 +42,7 @@ if(LIBQUIC_BUILD_TESTS)
         014-0rtt.cpp
         015-bt-encoding.cpp
         016-stateless_reset.cpp
+        job-queue.cpp
 
         case_logger.cpp
     )
