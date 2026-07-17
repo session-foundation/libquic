@@ -1,3 +1,9 @@
+oxen-libquic (1.8.0-1~deb14+1) forky; urgency=medium
+
+  * Rebuild
+
+ -- Jason Rhinelander <jason@session.foundation>  Fri, 17 Jul 2026 14:13:06 -0300
+
 oxen-libquic (1.8.0-1~deb14) forky; urgency=medium
 
   [ Jason Rhinelander ]
