@@ -2,6 +2,7 @@
 
 #include "address.hpp"
 #include "connection_ids.hpp"
+#include "loop.hpp"
 #include "utils.hpp"
 
 #include <oxenc/common.h>
@@ -43,6 +44,7 @@ namespace oxen::quic
 
         Endpoint& endpoint;
         Loop& loop;
+        JobQueue& job_queue;
 
         // The fixed Connection reference_id.  This will be the same as `get_conn()->reference_id`
         // while the connection exists, but persists even if the connection object gets destroyed.
@@ -114,15 +116,10 @@ namespace oxen::quic
         // Wraps an IOChannel (or derived type) accessor member function pointer in a call_get for
         // synchronous access that always returns by value (even if the member function returns by
         // reference).
-        template <
-                std::derived_from<IOChannel> Class,
-                typename T,
-                typename Ret = std::remove_cvref_t<T>,
-                typename EP = Endpoint>
+        template <std::derived_from<IOChannel> Class, typename T, typename Ret = std::remove_cvref_t<T>>
         Ret call_get_accessor(T (Class::*getter)() const) const
         {
-            return static_cast<EP&>(endpoint).job_queue.call_get(
-                    [this, &getter]() -> Ret { return (static_cast<const Class*>(this)->*getter)(); });
+            return job_queue.call_get([this, &getter]() -> Ret { return (static_cast<const Class*>(this)->*getter)(); });
         }
     };
 

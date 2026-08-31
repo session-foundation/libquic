@@ -42,6 +42,7 @@ if(LIBQUIC_BUILD_TESTS)
         014-0rtt.cpp
         015-bt-encoding.cpp
         016-stateless_reset.cpp
+        017-stream-stats.cpp
         018-unencrypted.cpp
         job-queue.cpp
 

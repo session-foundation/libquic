@@ -8,14 +8,14 @@ namespace oxen::quic
 {
 
     IOChannel::IOChannel(Connection& c, Endpoint& e) :
-            endpoint{e}, loop{endpoint.loop}, reference_id{c.reference_id()}, _conn{&c}
+            endpoint{e}, loop{endpoint.loop}, job_queue{endpoint.job_queue}, reference_id{c.reference_id()}, _conn{&c}
     {
         log::trace(log_cat, "{} called", __PRETTY_FUNCTION__);
     }
 
     std::shared_ptr<Connection> IOChannel::get_conn()
     {
-        return endpoint.job_queue.call_get([this] { return _conn ? _conn->shared_from_this() : nullptr; });
+        return job_queue.call_get([this] { return _conn ? _conn->shared_from_this() : nullptr; });
     }
 
     void IOChannel::send(std::string&& data)

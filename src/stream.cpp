@@ -9,7 +9,6 @@
 
 #include <cstddef>
 #include <exception>
-#include <iterator>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -66,7 +65,7 @@ namespace oxen::quic
             throw std::logic_error{
                     "Invalid enable_watermarks() call: alarm watermark ({}) must be > clear watermark ({})"_format(
                             alarm, clear)};
-        endpoint.job_queue.call_get([&] {
+        job_queue.call_get([this, &on_alarm, &on_clear, alarm, clear] {
             if (_is_closing || _send_fin)
             {
                 log::debug(log_cat, "Failed to set watermarks; stream is not active!");
@@ -94,7 +93,7 @@ namespace oxen::quic
 
     void Stream::disable_watermarks()
     {
-        endpoint.job_queue.call_get([this] {
+        job_queue.call_get([this] {
             if (!_watermarking)
                 return;
             _watermarking.reset();
@@ -107,7 +106,7 @@ namespace oxen::quic
 
     void Stream::pause()
     {
-        endpoint.job_queue.call_get([this]() {
+        job_queue.call_get([this]() {
             if (not _paused)
             {
                 log::debug(log_cat, "Pausing stream ID:{}", _stream_id);
@@ -121,7 +120,7 @@ namespace oxen::quic
 
     void Stream::resume()
     {
-        endpoint.job_queue.call_get([this]() {
+        job_queue.call_get([this]() {
             if (_paused)
             {
                 log::debug(log_cat, "Resuming stream ID:{}", _stream_id);
@@ -140,41 +139,47 @@ namespace oxen::quic
 
     bool Stream::is_paused() const
     {
-        return endpoint.job_queue.call_get([this]() { return _paused; });
+        return job_queue.call_get([this]() { return _paused; });
     }
 
     uint64_t Stream::acked_bytes() const
     {
-        return endpoint.job_queue.call_get([this] { return _acked_bytes; });
+        return job_queue.call_get([this] { return _acked_bytes; });
     }
 
     size_t Stream::unacked_bytes() const
     {
-        return endpoint.job_queue.call_get([this] { return _unacked_size; });
+        return job_queue.call_get([this] { return _unacked_size; });
     }
 
-    std::tuple<uint64_t, size_t, size_t> Stream::get_stats() const
+    size_t Stream::retained_bytes() const
     {
-        return endpoint.job_queue.call_get([this] { return std::tuple{_acked_bytes, _unacked_size, _unsent_size}; });
+        return job_queue.call_get([this] { return retained_impl(); });
+    }
+
+    std::tuple<uint64_t, size_t, size_t, size_t> Stream::get_stats() const
+    {
+        return job_queue.call_get(
+                [this] { return std::tuple{_acked_bytes, _unacked_size, _unsent_size, retained_impl()}; });
     }
 
     bool Stream::writable() const
     {
-        return endpoint.job_queue.call_get([this] { return !(_is_closing || _send_fin || _sent_fin); });
+        return job_queue.call_get([this] { return !(_is_closing || _send_fin || _sent_fin); });
     }
     bool Stream::readable() const
     {
-        return endpoint.job_queue.call_get([this] { return !(_is_closing || _received_fin); });
+        return job_queue.call_get([this] { return !(_is_closing || _received_fin); });
     }
 
     bool Stream::is_ready() const
     {
-        return endpoint.job_queue.call_get([this] { return _ready; });
+        return job_queue.call_get([this] { return _ready; });
     }
 
     std::optional<bool> Stream::watermark_status() const
     {
-        return endpoint.job_queue.call_get([this]() -> std::optional<bool> {
+        return job_queue.call_get([this]() -> std::optional<bool> {
             if (!_watermarking)
                 return std::nullopt;
             return _watermark_alarm;
@@ -190,7 +195,7 @@ namespace oxen::quic
 
     void Stream::send_fin()
     {
-        endpoint.job_queue.call([this] {
+        job_queue.call([this] {
             _send_fin = true;
             if (_conn)
                 _conn->packet_io_ready();
@@ -204,7 +209,7 @@ namespace oxen::quic
 
         // NB: this *must* be a call (not a call_soon) because Connection calls on a short-lived
         // Stream that won't survive a return to the event loop.
-        endpoint.job_queue.call([this, app_err_code]() {
+        job_queue.call([this, app_err_code]() {
             log::trace(log_cat, "{} called", __PRETTY_FUNCTION__);
 
             if (_is_closing)
@@ -232,15 +237,15 @@ namespace oxen::quic
 
     void Stream::set_data_callback(stream_data_callback cb)
     {
-        endpoint.job_queue.call_get([&] { _data_callback = std::move(cb); });
+        job_queue.call_get([this, &cb] { _data_callback = std::move(cb); });
     }
     void Stream::set_close_callback(stream_close_callback cb)
     {
-        endpoint.job_queue.call_get([&] { _close_callback = std::move(cb); });
+        job_queue.call_get([this, &cb] { _close_callback = std::move(cb); });
     }
     void Stream::set_fin_callback(std::function<void(Stream&)> cb)
     {
-        endpoint.job_queue.call_get([&] { _fin_callback = std::move(cb); });
+        job_queue.call_get([this, &cb] { _fin_callback = std::move(cb); });
     }
 
     void Stream::closed(uint64_t app_code)
@@ -266,24 +271,20 @@ namespace oxen::quic
         log::trace(log_cat, "{} called", __PRETTY_FUNCTION__);
 
         const auto& [alarm_thresh, clear_thresh] = *_watermarking;
-        const size_t threshold = _unacked_size + (_watermark_alarm ? clear_thresh + 1 : alarm_thresh);
-        size_t sum = 0;
-        for (auto it = user_buffers.begin(); sum < threshold && it != user_buffers.end(); ++it)
-            sum += it->first.size();
         if (_watermark_alarm)
         {
-            if (sum < threshold)
+            if (_unsent_size <= clear_thresh)
             {
-                log::debug(log_cat, "Watermark ({} unsent) dropped <= clear threshold ({})", sum, clear_thresh);
+                log::debug(log_cat, "Watermark ({} unsent) dropped <= clear threshold ({})", _unsent_size, clear_thresh);
                 _watermark_alarm = false;
                 if (_watermark_on_clear)
                     _watermark_on_clear(*this);
             }
         }
-        else if (sum >= threshold)
+        else if (_unsent_size >= alarm_thresh)
         {
-            // "at least" because the sum above terminates early if we met the threshold
-            log::debug(log_cat, "Watermark triggered alarm threshold ({}+ unsent >= alarm threshold {})", sum, alarm_thresh);
+            log::debug(
+                    log_cat, "Watermark triggered alarm threshold ({} unsent >= alarm threshold {})", _unsent_size, alarm_thresh);
             _watermark_alarm = true;
             if (_watermark_on_alarm)
                 _watermark_on_alarm(*this);
@@ -293,11 +294,10 @@ namespace oxen::quic
     void Stream::append_buffer(std::span<const std::byte> buffer, std::shared_ptr<void> keep_alive)
     {
         log::trace(log_cat, "{} called", __PRETTY_FUNCTION__);
-        assert(endpoint.job_queue.inside());
+        assert(job_queue.inside());
         assert(_conn);
 
         _unsent_size += buffer.size();
-        _total_buffer_size += buffer.size();
         user_buffers.emplace_back(buffer, std::move(keep_alive));
         if (_watermarking)
             check_watermark();
@@ -311,7 +311,7 @@ namespace oxen::quic
     void Stream::acknowledge(size_t bytes)
     {
         log::trace(log_cat, "{} called", __PRETTY_FUNCTION__);
-        log::trace(log_cat, "Acking {} bytes of {}/{} unacked/size", bytes, _unacked_size, _total_buffer_size);
+        log::trace(log_cat, "Acking {} bytes of {}/{} unacked/unsent", bytes, _unacked_size, _unsent_size);
 
         assert(bytes <= _unacked_size);
         _unacked_size -= bytes;
@@ -320,9 +320,11 @@ namespace oxen::quic
         // Drop all fully-acked buffers that are no longer needed
         while (bytes && bytes >= user_buffers.front().first.size())
         {
-            _total_buffer_size -= user_buffers.front().first.size();
             bytes -= user_buffers.front().first.size();
             user_buffers.pop_front();
+            // Whatever had been trimmed off the old front is released along with it, and the new
+            // front (if any) has never been trimmed:
+            _front_trimmed = 0;
             assert(_current_buffer_index > 0);
             _current_buffer_index -= 1;
             log::trace(log_cat, "bytes: {}", bytes);
@@ -333,6 +335,7 @@ namespace oxen::quic
         {
             auto& front = user_buffers.front().first;
             front = front.subspan(bytes);
+            _front_trimmed += bytes;
             if (_current_buffer_index == 0)
             {
                 assert(_current_buffer_offset >= bytes);
@@ -340,7 +343,7 @@ namespace oxen::quic
             }
         }
 
-        log::trace(log_cat, "{} bytes acked, {} unacked remaining", bytes, _total_buffer_size);
+        log::trace(log_cat, "{} bytes acked, {} unacked remaining", bytes, _unacked_size);
     }
 
     void Stream::wrote(size_t bytes)
@@ -367,31 +370,17 @@ namespace oxen::quic
         }
     }
 
-    static auto get_buffer_it(std::deque<std::pair<std::span<const std::byte>, std::shared_ptr<void>>>& bufs, size_t offset)
-    {
-        log::trace(log_cat, "{} called", __PRETTY_FUNCTION__);
-        auto it = bufs.begin();
-
-        while (offset >= it->first.size() && it != bufs.end() && offset)
-        {
-            offset -= it->first.size();
-            it++;
-        }
-
-        return std::make_pair(std::move(it), offset);
-    }
-
     void Stream::revert_stream()
     {
-        assert(endpoint.job_queue.inside());
+        assert(job_queue.inside());
         log::trace(log_cat, "Stream (ID:{}) reverting after early data rejected...", _stream_id);
+        _unsent_size += _unacked_size;
         _unacked_size = 0;
         _current_buffer_index = 0;
         _current_buffer_offset = 0;
-        _unsent_size = _total_buffer_size;
         if (_had_notify)
             _notify = true;
-        log::debug(log_cat, "Stream (ID:{}) has {}B in buffer, 0B unacked...", _stream_id, _total_buffer_size);
+        log::debug(log_cat, "Stream (ID:{}) has {}B in buffer, 0B unacked...", _stream_id, _unsent_size);
     }
 
     std::pair<std::vector<ngtcp2_vec>, bool> Stream::pending(size_t bytes)
@@ -439,7 +428,7 @@ namespace oxen::quic
         // still actually alive.  (But if we're already in the event loop the lambda fires
         // immediately and we don't want to have to do an extra refcount increment/decrement).
         std::optional<std::weak_ptr<Stream>> wself;
-        if (!endpoint.job_queue.inside())
+        if (!job_queue.inside())
             wself = weak_from_this();
 
         // In theory, `endpoint` that we use here might be inaccessible as well, but unlike conn
@@ -447,7 +436,7 @@ namespace oxen::quic
         // events) the application has control and responsibility for keeping the network/endpoint
         // alive at least as long as all the Connections/Streams that instances that were attached
         // to it.
-        endpoint.job_queue.call([this, wself = std::move(wself), data, ka = std::move(keep_alive)]() {
+        job_queue.call([this, wself = std::move(wself), data, ka = std::move(keep_alive)]() {
             std::shared_ptr<Stream> sself;
             if (wself)
             {
