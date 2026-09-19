@@ -354,8 +354,13 @@ namespace oxen::quic
         GNUTLSCreds();
 
       public:
-        // Construct a credentials object from a Ed25519 seed and pubkey.  (The seed may optionally
-        // be a combined seed+pk libsodium 64-byte value; only the first 32 bytes are used).
+        // Construct a credentials object from a 32-byte Ed25519 seed and 32-byte pubkey.
+        //
+        // The seed may instead be a combined seed+pk libsodium 64-byte value, in which case only
+        // the first 32 bytes are used, and the pubkey given must match the one it carries.
+        //
+        // Throws std::invalid_argument if either value is the wrong size, or if a 64-byte seed
+        // disagrees with the given pubkey.
         static std::shared_ptr<GNUTLSCreds> make_from_ed_keys(std::string_view seed, std::string_view pubkey);
         // Construct a credentials object from a Ed25519 combined seed/pubkey value.
         static std::shared_ptr<GNUTLSCreds> make_from_ed_seckey(std::string_view sk);

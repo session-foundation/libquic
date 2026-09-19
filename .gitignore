@@ -11,3 +11,7 @@ rebuild.sh
 full_rebuild.sh
 notes.txt
 /compile_commands.json
+__pycache__/
+*.egg-info/
+/python/seshquic/_core*.so
+/python/seshquic/_core*.pyd

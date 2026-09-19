@@ -45,6 +45,7 @@ if(LIBQUIC_BUILD_TESTS)
         017-stream-stats.cpp
         018-unencrypted.cpp
         019-btreq-destruction.cpp
+        020-close-flush.cpp
         job-queue.cpp
 
         case_logger.cpp

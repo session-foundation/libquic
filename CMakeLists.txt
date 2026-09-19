@@ -33,6 +33,7 @@ option(LIBQUIC_WARN_DEPRECATED "warn deprecated" ON)
 option(LIBQUIC_BUILD_TESTS "Build libquic test suite" ${libquic_IS_TOPLEVEL_PROJECT})
 option(LIBQUIC_BUILD_SPEEDTEST "Build libquic speedtest programs" ${libquic_IS_TOPLEVEL_PROJECT})
 option(LIBQUIC_BUILD_BTREQTEST "Build bt-stream request tester" ${libquic_IS_TOPLEVEL_PROJECT})
+option(LIBQUIC_BUILD_PYTHON "Build the seshquic Python module" OFF)
 
 # This is mainly useful for system packaging to create libquic.so.x.y instead of just libquic.so:
 option(LIBQUIC_VERSION_SO "Add the project major/minor version into the shared library filename" OFF)
@@ -135,6 +136,10 @@ add_subdirectory(src)
 
 if(LIBQUIC_BUILD_TESTS OR LIBQUIC_BUILD_SPEEDTEST)
     add_subdirectory(tests)
+endif()
+
+if(LIBQUIC_BUILD_PYTHON)
+    add_subdirectory(python)
 endif()
 
 add_library(oxen::quic ALIAS quic)
