@@ -294,20 +294,24 @@ namespace oxen::quic
         /// Throws if the queue has been stopped, or if `f` is empty.
         TimerID add_timer(std::chrono::microseconds interval, std::function<void()> f);
 
-        /// Registers `f()` with no timer, to be run only when fired via `wake()`.  Equivalent to
-        /// `add_timer(0us, f)`, throws in the same cases; see also `add_wakeable()`, which spells
-        /// this more legibly.
-        TimerID add_timer(std::function<void()> f);
+        /// Registers `f()` with no initial timer and so will not be scheduled to be called.  This is intended
+        /// for cases where a timer is needed, but will be scheduled at a later point.
+        ///
+        /// Equivalent to `add_timer(0us, f)`, throws in the same cases.
+        [[nodiscard]] TimerID add_timer(std::function<void()> f);
 
         /// Registers `f()` to be run only when fired via `wake()`.
         ///
-        /// This is purely a readability shortcut: it does nothing that `add_timer(0us, f)` does not
-        /// already do, and exists only because `add_timer()` with no interval reads oddly at a call
-        /// site for something that is not, yet, a timer.  The result is an ordinary timer in every
-        /// other respect -- same TimerID, and `repeat()` can give it an interval at any point.
+        /// This creates a wakeable function that can be triggered by passing the returned TimerID
+        /// into wake.  This is simply an alias for `add_timer(f)` (a timer without an actual repeat
+        /// interval set up is itself manually wakeable), but this alias is strongly recommended to
+        /// signal intent when a plain wakeable function is intended.
+        ///
+        /// Waking this function is idempotent (i.e. multiple calls before the function actually
+        /// runs are collapsed): see `wake()`.
         ///
         /// Throws if the queue has been stopped, or if `f` is empty.
-        TimerID add_wakeable(std::function<void()> f);
+        [[nodiscard]] TimerID add_wakeable(std::function<void()> f);
 
         /// Fires `id` as soon as the event loop can get to it, regardless of whether it has a
         /// repeat timer or when that timer is next due.
