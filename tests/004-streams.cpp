@@ -1074,7 +1074,7 @@ namespace oxen::quic::test
 
         auto [client_tls, server_tls] = defaults::tls_creds_from_ed_keys();
 
-        static constexpr auto RESP_DELAY = 50ms;
+        static constexpr auto RESP_DELAY = 100ms;
 
         auto server_endpoint = Endpoint::endpoint(loop, server_local, [](Connection& c) {
             auto ss = c.queue_incoming_stream<BTRequestStream>();
@@ -1110,7 +1110,11 @@ namespace oxen::quic::test
 
         stream->command("a", "", -1ms, a_cb);
 
-        REQUIRE(a_cb.wait(20ms));
+        // Bounded by RESP_DELAY/2 rather than something generous on purpose: "b" has to be sent
+        // before "a"'s reply arrives at RESP_DELAY for this test to be testing anything, so a wait
+        // that outlasts that window should fail rather than pass vacuously.  20ms was too tight --
+        // the timer is armed for "now", but the loop thread can still be busy handshaking.
+        REQUIRE(a_cb.wait(RESP_DELAY / 2));
         CHECK(a_resp == "TIMEOUT");
 
         // Sleep until halfway in the first request waiting period, then fire off a second request.
@@ -1166,11 +1170,6 @@ namespace oxen::quic::test
                 b_resp = m.body();
         }};
 
-#ifdef __APPLE__
-        int apple_sucks_factor = 5;
-#else
-        int apple_sucks_factor = 1;
-#endif
         stream->command("null", "", apple_sucks_factor * 50ms, a_cb);
 
         // Should do nothing yet:

@@ -6,6 +6,7 @@
 #include "gnutls_crypto.hpp"
 #include "internal.hpp"
 #include "iochannel.hpp"
+#include "oxen/quic/unencrypted.hpp"
 #include "result.hpp"
 #include "stream.hpp"
 #include "udp.hpp"
@@ -149,24 +150,135 @@ namespace oxen::quic
             return 0;
         }
 
+        // The no-op crypto callbacks used when a connection is running without encryption; see
+        // oxen/quic/unencrypted.hpp.  ngtcp2 requires all of these to be set even when there is
+        // nothing for them to do.
+
+        static int unencrypted_encrypt(
+                uint8_t* dest,
+                const ngtcp2_crypto_aead* aead,
+                const ngtcp2_crypto_aead_ctx*,
+                const uint8_t* plaintext,
+                size_t plaintextlen,
+                const uint8_t*,
+                size_t,
+                const uint8_t*,
+                size_t)
+        {
+            // ngtcp2 allows dest to alias plaintext, in which case there is nothing to move.
+            if (dest != plaintext)
+                std::memmove(dest, plaintext, plaintextlen);
+
+            // We claim one byte of AEAD overhead (see unencrypted.cpp) which nothing writes, so zero
+            // it rather than shipping whatever the last packet left in the send buffer.
+            if (aead->max_overhead)
+                std::memset(dest + plaintextlen, 0, aead->max_overhead);
+
+            return 0;
+        }
+
+        static int unencrypted_decrypt(
+                uint8_t* dest,
+                const ngtcp2_crypto_aead* aead,
+                const ngtcp2_crypto_aead_ctx*,
+                const uint8_t* ciphertext,
+                size_t ciphertextlen,
+                const uint8_t*,
+                size_t,
+                const uint8_t*,
+                size_t)
+        {
+            // The plaintext is everything but the overhead we claim; dest is only guaranteed to have
+            // room for that much.
+            auto plaintextlen = ciphertextlen - aead->max_overhead;
+            if (dest != ciphertext)
+                std::memmove(dest, ciphertext, plaintextlen);
+            return 0;
+        }
+
+        static int unencrypted_hp_mask(
+                uint8_t* dest, const ngtcp2_crypto_cipher*, const ngtcp2_crypto_cipher_ctx*, const uint8_t*)
+        {
+            // A zero mask leaves the header bits and packet number in the clear.
+            std::memset(dest, 0, NGTCP2_HP_MASKLEN);
+            return 0;
+        }
+
+        static int unencrypted_update_key(
+                ngtcp2_conn*,
+                uint8_t*,
+                uint8_t*,
+                ngtcp2_crypto_aead_ctx*,
+                uint8_t*,
+                ngtcp2_crypto_aead_ctx*,
+                uint8_t*,
+                const uint8_t*,
+                const uint8_t*,
+                size_t,
+                void*)
+        {
+            // Key updates cannot happen: there are no keys, and the encryption limits that would
+            // trigger one are set to their maximums.
+            return 0;
+        }
+
+        static void unencrypted_delete_aead_ctx(ngtcp2_conn*, ngtcp2_crypto_aead_ctx*, void*) {}
+        static void unencrypted_delete_cipher_ctx(ngtcp2_conn*, ngtcp2_crypto_cipher_ctx*, void*) {}
+
+        static int on_unencrypted_recv_crypto_data(
+                ngtcp2_conn*,
+                ngtcp2_encryption_level level,
+                uint64_t /*offset*/,
+                const uint8_t* data,
+                size_t datalen,
+                void* user_data)
+        {
+            return static_cast<Connection*>(user_data)->unencrypted_recv_crypto_data(level, {data, datalen});
+        }
+
+        // Associates the client's initial DCID with the connection; shared by the encrypted and
+        // unencrypted paths, which differ only in how the initial keys get installed.
+        static void associate_initial_dcid(ngtcp2_conn* conn, void* user_data)
+        {
+            // We store the client initial DCID as that will be used by 0-RTT packets that
+            // arrive before the handshake completes.  However, since we didn't get to safely
+            // choose this, we only set if it not already used (so that a possible collision
+            // between the temporary dcid and some scid we generated properly yields to the
+            // latter).
+            if (auto init_dcid = ngtcp2_conn_get_client_initial_dcid(conn); init_dcid && init_dcid->datalen)
+            {
+                auto& c = *static_cast<Connection*>(user_data);
+                c.endpoint().associate_cid(*init_dcid, c, true);
+            }
+            else
+                log::trace(log_cat, "No initial dcid to associate");
+        }
+
+        static int on_unencrypted_version_negotiation(ngtcp2_conn*, uint32_t version, const ngtcp2_cid*, void* user_data)
+        {
+            return static_cast<Connection*>(user_data)->unencrypted_version_negotiation(version);
+        }
+
+        static int on_unencrypted_client_initial(ngtcp2_conn*, void* user_data)
+        {
+            return static_cast<Connection*>(user_data)->unencrypted_client_initial();
+        }
+
+        static int on_unencrypted_recv_client_initial(ngtcp2_conn*, const ngtcp2_cid*, void* user_data)
+        {
+            auto& c = *static_cast<Connection*>(user_data);
+            if (auto rv = c.unencrypted_recv_client_initial(); rv != 0)
+                return rv;
+
+            associate_initial_dcid(c, user_data);
+            return 0;
+        }
+
         static int on_recv_client_initial(ngtcp2_conn* conn, const ngtcp2_cid* dcid, void* user_data)
         {
             int rv = ngtcp2_crypto_recv_client_initial_cb(conn, dcid, user_data);
             if (rv == 0)
-            {
-                // We store the client initial DCID as that will be used by 0-RTT packets that
-                // arrive before the handshake completes.  However, since we didn't get to safely
-                // choose this, we only set if it not already used (so that a possible collision
-                // between the temporary dcid and some scid we generated properly yields to the
-                // latter).
-                if (auto init_dcid = ngtcp2_conn_get_client_initial_dcid(conn); init_dcid && init_dcid->datalen)
-                {
-                    auto& conn = *static_cast<Connection*>(user_data);
-                    conn.endpoint().associate_cid(*init_dcid, conn, true);
-                }
-                else
-                    log::trace(log_cat, "No initial dcid to associate");
-            }
+                associate_initial_dcid(conn, user_data);
             return rv;
         }
 
@@ -1747,6 +1859,22 @@ namespace oxen::quic
         callbacks.recv_stateless_reset = connection_callbacks::recv_stateless_reset;
         callbacks.dcid_status = connection_callbacks::on_connection_id_status;
 
+        if (_unencrypted)
+        {
+            // Everything the ngtcp2_crypto helper would do goes through a TLS session that does not
+            // exist here, so the crypto callbacks are replaced with no-ops and the handshake is
+            // driven by hand.  See oxen/quic/unencrypted.hpp.
+            callbacks.recv_crypto_data = connection_callbacks::on_unencrypted_recv_crypto_data;
+            callbacks.encrypt = connection_callbacks::unencrypted_encrypt;
+            callbacks.decrypt = connection_callbacks::unencrypted_decrypt;
+            callbacks.hp_mask = connection_callbacks::unencrypted_hp_mask;
+            callbacks.update_key = connection_callbacks::unencrypted_update_key;
+            callbacks.delete_crypto_aead_ctx = connection_callbacks::unencrypted_delete_aead_ctx;
+            callbacks.delete_crypto_cipher_ctx = connection_callbacks::unencrypted_delete_cipher_ctx;
+            callbacks.version_negotiation = connection_callbacks::on_unencrypted_version_negotiation;
+            callbacks.recv_client_initial = connection_callbacks::on_unencrypted_recv_client_initial;
+        }
+
         ngtcp2_settings_default(&settings);
 
         settings.initial_ts = get_timestamp().count();
@@ -1845,6 +1973,8 @@ namespace oxen::quic
             assert(tls_creds && tls_creds->has_credentials());
         }
 
+        _unencrypted = dynamic_cast<DangerouslyUnencryptedCreds*>(tls_creds.get()) != nullptr;
+
         // If a connection_{established/closed}_callback was passed to IOContext via `Endpoint::{listen,connect}(...)`...
         //  - If this is an outbound, steal the callback to be used once. Outbound connections
         //    generate a new IOContext for each call to `::connect(...)`
@@ -1902,7 +2032,8 @@ namespace oxen::quic
 
         if (is_outbound())
         {
-            callbacks.client_initial = ngtcp2_crypto_client_initial_cb;
+            callbacks.client_initial =
+                    _unencrypted ? connection_callbacks::on_unencrypted_client_initial : ngtcp2_crypto_client_initial_cb;
             callbacks.handshake_confirmed = connection_callbacks::on_handshake_confirmed;
             callbacks.recv_retry = connection_callbacks::on_recv_retry;
             callbacks.recv_new_token = connection_callbacks::on_recv_token;
@@ -1930,7 +2061,8 @@ namespace oxen::quic
         }
         else
         {
-            callbacks.recv_client_initial = connection_callbacks::on_recv_client_initial;
+            if (!_unencrypted)
+                callbacks.recv_client_initial = connection_callbacks::on_recv_client_initial;
 
             if (ocid)
             {
