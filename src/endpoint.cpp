@@ -493,16 +493,17 @@ namespace oxen::quic
 
         schedule_conn_cleanup(conn);
 
-        send_or_queue_packet(conn.path(), std::move(buf), /*ecn=*/0, [this, &conn](io_result rv) {
-            if (rv.failure())
-            {
-                log::warning(
-                        log_cat,
-                        "Error: failed to send close packet [{}]; removing connection ({})",
-                        rv.str_error(),
-                        conn.reference_id());
-                delete_connection(conn);
-            }
+        // A blocked send parks this callback on the socket until it becomes writeable, but the
+        // cleanup scheduled just above is on a timer that does not wait for that: it can fire, and
+        // destroy the connection, first.  Hence the id-and-lookup rather than capturing `conn`.
+        send_or_queue_packet(conn.path(), std::move(buf), /*ecn=*/0, [this, rid = conn.reference_id()](io_result rv) {
+            if (not rv.failure())
+                return;
+
+            log::warning(log_cat, "Error: failed to send close packet [{}]; removing connection ({})", rv.str_error(), rid);
+
+            if (auto c = get_conn(rid))
+                delete_connection(*c);
         });
     }
 
