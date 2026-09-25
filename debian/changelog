@@ -1,3 +1,37 @@
+oxen-libquic (1.9.0-1~ubuntu2204) jammy; urgency=medium
+
+  * Use builds.session.codes for build uploads
+  * Add credentials that disable encryption entirely
+  * Bump version to 1.9.0
+  * Bump oxen-logging (adds log sink removal)
+  * bump logging to latest
+  * Collapse ConnectionID's comparison operators to a defaulted <=>
+  * Add JobQueue timer registry to replace Ticker/Wakeable
+  * Stop the timer tests assuming a fixed sleep was long enough
+  * Use apple_sucks_factor for the timer tests' timings
+  * Bump session-deps to latest
+  * Make check_watermark O(1)
+  * Fix retained buffer accounting; expose it as retained_bytes()
+  * Cleanups: job_queue reference, explicit captures, dead code
+  * Add stream byte accounting tests
+  * Timer tests: use the existing wait_for() helper
+  * Widen the reply-matching test's timeout window
+  * Wake the connection when resuming a paused stream
+  * Stop one comparison producing 50k lines of test log
+  * Make the transfer waits in 017 an assertion rather than a ceiling
+  * Fix use-after-free in BTRequestStream deferred job lambdas
+  * Don't destroy dropped jobs while holding the queue mutex
+  * Give each IOChannel its own JobQueue
+  * Let a sent_request outlive its stream
+  * Guarantee a sent_request's callback is always fired
+  * Add tests for sent_request destruction paths
+  * Avoid memcpy from a null pointer in RemoteAddress
+  * Assert that a destruction-path timeout has no accessible stream
+  * Don't capture a Connection in the close packet send callback
+  * add_timer/wakeable(): better docs, [[nodiscard]]
+
+ -- Jason Rhinelander <jason@session.foundation>  Fri, 25 Sep 2026 19:38:45 -0300
+
 oxen-libquic (1.8.0-1~ubuntu2204) jammy; urgency=medium
 
   [ Jason Rhinelander ]
