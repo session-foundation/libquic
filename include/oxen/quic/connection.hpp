@@ -424,6 +424,30 @@ namespace oxen::quic
         std::shared_ptr<TLSCreds> tls_creds;
         std::unique_ptr<TLSSession> tls_session;
 
+        // Set when the credentials are DangerouslyUnencryptedCreds, in which case this connection
+        // does no encryption at all and the handshake below stands in for TLS.  See
+        // oxen/quic/unencrypted.hpp for what that means and when it is appropriate.
+        bool _unencrypted{false};
+
+        // Our encoded handshake messages, which a TLS handshake would otherwise have carried.  Held
+        // for the life of the connection because ngtcp2 does not copy submitted crypto data.
+        std::vector<uint8_t> _unencrypted_tx_initial;
+        std::vector<uint8_t> _unencrypted_tx_handshake;
+
+        // Received crypto data, accumulated per level: ngtcp2 hands us contiguous in-order chunks of
+        // the crypto stream, not whole messages, so a message can arrive in pieces.
+        std::vector<uint8_t> _unencrypted_rx_initial;
+        std::vector<uint8_t> _unencrypted_rx_handshake;
+
+        void unencrypted_initial_keys();
+        int unencrypted_client_initial();
+        int unencrypted_recv_client_initial();
+        int unencrypted_version_negotiation(uint32_t version);
+        int unencrypted_recv_crypto_data(ngtcp2_encryption_level level, std::span<const uint8_t> data);
+        int unencrypted_send(ngtcp2_encryption_level level, bool with_transport_params);
+        int unencrypted_handle_message(ngtcp2_encryption_level level, std::span<const uint8_t> payload);
+        void unencrypted_complete_handshake();
+
         event_ptr packet_retransmit_timer;
         event_ptr packet_io_trigger;
 

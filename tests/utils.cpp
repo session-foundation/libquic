@@ -87,6 +87,11 @@ namespace oxen::quic
         return ep.get_socket()->sock_;
     }
 
+    void TestHelper::drop_connection_now(Endpoint& ep, Connection& conn, uint64_t ec)
+    {
+        ep._drop_connection(conn, io_error{ec});
+    }
+
     void TestHelper::enable_dgram_drop(Connection& ci)
     {
         auto& conn = static_cast<Connection&>(ci);
