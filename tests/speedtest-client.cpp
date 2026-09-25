@@ -540,7 +540,7 @@ ping_stats run_ping_client(
     std::atomic<bool> reconnect{reconn};
 
     std::optional<std::promise<void>> all_done;
-    std::shared_ptr<Ticker> ticker;
+    TimerID ping_timer;
     std::chrono::steady_clock::time_point started, established;
 
 #ifndef _WIN32
@@ -620,8 +620,7 @@ ping_stats run_ping_client(
             if (now >= *timeout)
             {
                 log::warning(SPEEDTEST, "Timeout waiting for final ping response; disconnecting");
-                if (ticker)
-                    ticker->stop();
+                client->loop.stop(ping_timer);
                 client_conn->close_connection();
             }
             return;
@@ -674,12 +673,17 @@ ping_stats run_ping_client(
         client_dg.reset();
 
         send_ping();
-        if (ticker)
-            ticker->stop();
-        ticker = client->loop.call_every(ping_wait, send_ping);
+        if (ping_timer)
+            client->loop.repeat(ping_timer, ping_wait);
+        else
+            ping_timer = client->loop.add_timer(ping_wait, send_ping);
 
         all_done->get_future().wait();
     } while (reconnect);
+
+    // The loop owns the timer, so unlike the Ticker this replaced it does not stop itself when we
+    // return; it has to go before send_ping's captured locals do.
+    client->loop.remove(ping_timer);
 
 #ifndef _WIN32
     kill(0, SIGUSR2);  // Wake up the signal handling thread to exit cleanly
