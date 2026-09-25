@@ -26,8 +26,8 @@ namespace oxen::quic
         return {bsubstr - data.data(), substr.size()};
     }
 
-    message::message(BTRequestStream& bp, std::vector<std::byte> req, bool is_timeout) :
-            data{std::move(req)}, return_sender{bp.weak_from_this()}, _rid{bp.reference_id}, timed_out{is_timeout}
+    message::message(std::weak_ptr<Stream> sender, ConnectionID rid, std::vector<std::byte> req, bool is_timeout) :
+            data{std::move(req)}, return_sender{std::move(sender)}, _rid{std::move(rid)}, timed_out{is_timeout}
     {
         if (!is_timeout)
         {
@@ -49,10 +49,53 @@ namespace oxen::quic
     {
         log::trace(log_cat, "{} called", __PRETTY_FUNCTION__);
 
-        if (auto ptr = return_sender.lock())
+        if (auto ptr = std::dynamic_pointer_cast<BTRequestStream>(return_sender.lock()))
             ptr->respond(req_id, body, error);
         else
             log::debug(log_cat, "Dropping response: stream has gone away");
+    }
+
+    BTRequestStream::~BTRequestStream()
+    {
+        // Must precede destruction of the members our queued jobs reference; see IOChannel.  Any
+        // command job discarded here fails its own request as it is destroyed.
+        job_queue.stop();
+
+        // Fail anything still outstanding.  Normally `closed()` will already have done this, but
+        // not on every teardown path: a connection closing quietly skips close_all_streams() and
+        // goes straight to drop_streams().  Moved out first so that a callback reaching back into
+        // us can't insert into the container we are clearing.
+        req_expiries.clear();
+        auto reqs = std::exchange(sent_reqs, {});
+        reqs.clear();
+    }
+
+    void sent_request::deliver(message m)
+    {
+        auto f = std::exchange(cb, nullptr);
+        if (!f)
+            return;
+
+        // Nothing may escape: we are reachable from ~sent_request, and so from destructors all the
+        // way up, where an escaping exception would terminate.
+        try
+        {
+            f(std::move(m));
+        }
+        catch (const std::exception& e)
+        {
+            log::error(log_cat, "Uncaught exception from sent request response handler: {}", e.what());
+        }
+        catch (...)
+        {
+            log::error(log_cat, "Uncaught non-standard exception from sent request response handler");
+        }
+    }
+
+    void sent_request::time_out()
+    {
+        if (cb)
+            deliver(std::move(*this).to_timeout());
     }
 
     void BTRequestStream::handle_opt(std::function<void(message m)> request_handler)
@@ -86,17 +129,7 @@ namespace oxen::quic
         req_expiries.erase(req_expiries.begin(), it);
 
         for (auto& sr : expired)
-        {
-            auto& f = *sr;
-            try
-            {
-                f.cb(std::move(f).to_timeout());
-            }
-            catch (const std::exception& e)
-            {
-                log::error(log_cat, "Uncaught exception from timeout response handler: {}", e.what());
-            }
-        }
+            sr->time_out();
     }
 
     void BTRequestStream::update_timeout()
@@ -169,7 +202,7 @@ namespace oxen::quic
 
     void BTRequestStream::register_handler(std::string ep, std::function<void(message)> func)
     {
-        endpoint.job_queue.call([this, ep = std::move(ep), func = std::move(func)]() mutable {
+        job_queue.call([this, ep = std::move(ep), func = std::move(func)]() mutable {
             registered_endpoints[std::move(ep)] = std::move(func);
         });
     }
@@ -177,7 +210,7 @@ namespace oxen::quic
     void BTRequestStream::register_generic_handler(std::function<void(message)> request_handler)
     {
         log::debug(log_cat, "BTRequestStream set generic request handler");
-        endpoint.job_queue.call([this, func = std::move(request_handler)]() mutable { generic_handler = std::move(func); });
+        job_queue.call([this, func = std::move(request_handler)]() mutable { generic_handler = std::move(func); });
     }
 
     void BTRequestStream::handle_input(message msg)
@@ -224,14 +257,7 @@ namespace oxen::quic
             // otherwise we didn't find it, or it wasn't at the front, so we don't need to reset
             // the timer (because the timer is synced with the first element).
 
-            try
-            {
-                req->cb(std::move(msg));
-            }
-            catch (const std::exception& e)
-            {
-                log::error(log_cat, "Uncaught exception from response handler: {}", e.what());
-            }
+            req->deliver(std::move(msg));
             return;
         }
 
@@ -347,7 +373,7 @@ namespace oxen::quic
 
             if (data_accumulator(buf, req, current_len))
             {
-                handle_input(message{*this, std::move(buf)});
+                handle_input(message{weak_stream(), reference_id, std::move(buf)});
                 buf.clear();
 
                 // Back to the top to try processing another request that might have arrived in
@@ -384,24 +410,12 @@ namespace oxen::quic
     {
         if (is_closing())
         {
-            // The stream is already dead, so fire the failure callback as a timeout right away and
-            // drop the request, since we know it can never complete.  (This isn't necessarily the
-            // application's fault: the closing could have started while queuing this new command
-            // for the event loop).
-            auto& f = *req;
-            if (f.cb)
-            {
-                try
-                {
-                    f.cb(std::move(f).to_timeout());
-                }
-                catch (const std::exception& e)
-                {
-                    log::error(log_cat, "Uncaught exception from closed-stream sent request response handler: {}", e.what());
-                }
-            }
+            // The stream is already dead, so drop the request: it can never complete.  (This isn't
+            // necessarily the application's fault: the closing could have started while queuing
+            // this new command for the event loop.)  ~sent_request fails the callback for us.
             return nullptr;
         }
+
         auto req_id = req->req_id;
         auto& sent_req = sent_reqs[req_id];
         sent_req = std::move(req);

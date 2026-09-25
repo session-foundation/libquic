@@ -3,6 +3,7 @@
 #include <ngtcp2/ngtcp2.h>
 
 #include <cassert>
+#include <compare>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -26,10 +27,7 @@ namespace oxen::quic
         ConnectionID& operator=(const ConnectionID& obj) = default;
         ConnectionID& operator=(ConnectionID&& obj) = default;
 
-        inline bool operator<(const ConnectionID& other) const { return id < other.id; }
-
-        inline bool operator==(const ConnectionID& other) const { return id == other.id; }
-        inline bool operator!=(const ConnectionID& other) const { return !(*this == other); }
+        auto operator<=>(const ConnectionID&) const = default;
 
         explicit operator const uint64_t&() const { return id; }
 
@@ -63,8 +61,6 @@ namespace oxen::quic
             return _ngtcp2_cid.datalen == other._ngtcp2_cid.datalen &&
                    std::memcmp(_ngtcp2_cid.data, other._ngtcp2_cid.data, _ngtcp2_cid.datalen) == 0;
         }
-
-        inline bool operator!=(const quic_cid& other) const = default;
 
         static quic_cid random();
 
