@@ -321,10 +321,10 @@ namespace oxen::quic
         RemoteAddress() = delete;
 
         template <typename... Opt>
-        RemoteAddress(std::string_view remote_pk, Opt&&... opts) :
-                Address{std::forward<Opt>(opts)...}, _remote_pubkey(remote_pk.size())
+        RemoteAddress(std::string_view remote_pk, Opt&&... opts) : Address{std::forward<Opt>(opts)...}
         {
-            std::memcpy(_remote_pubkey.data(), remote_pk.data(), remote_pk.size());
+            auto* pk = reinterpret_cast<const unsigned char*>(remote_pk.data());
+            _remote_pubkey.assign(pk, pk + remote_pk.size());
         }
 
         template <typename... Opt>

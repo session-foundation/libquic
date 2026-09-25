@@ -7,6 +7,9 @@
 
 #include <fmt/ranges.h>
 
+#include <atomic>
+#include <mutex>
+
 namespace oxen::quic
 {
     static auto ev_cat = log::Cat("ev-loop");
@@ -37,7 +40,7 @@ namespace oxen::quic
     {
         if (event_add(ev.get(), &interval) != 0)
         {
-            log::warning(log_cat, "EventHandler failed to start repeating event!");
+            log::warning(log_cat, "Ticker failed to start repeating event!");
             return false;
         }
 
@@ -48,7 +51,7 @@ namespace oxen::quic
     {
         if (ev && event_del(ev.get()) != 0)
         {
-            log::warning(log_cat, "EventHandler failed to pause repeating event!");
+            log::warning(log_cat, "Ticker failed to pause repeating event!");
             return false;
         }
         return true;
@@ -110,18 +113,19 @@ namespace oxen::quic
         }
 #endif
 
-        if (static bool once = false; !once)
-        {
-            once = true;
+        // Older versions of libevent do not like having the thread setup called multiple times, so
+        // this must stay a once-only initialization even if multiple Loops are constructed
+        // concurrently from different threads.
+        static std::once_flag ev_init_once;
+        std::call_once(ev_init_once, [] {
             setup_libevent_logging();
 
-            // Older versions of libevent do not like having this called multiple times
 #ifdef _WIN32
             evthread_use_windows_threads();
 #else
             evthread_use_pthreads();
 #endif
-        }
+        });
 
         static std::vector<std::string_view> ev_methods_avail = get_ev_methods();
         log::debug(
@@ -156,18 +160,61 @@ namespace oxen::quic
         log::info(log_cat, "libevent loop is started");
     }
 
-    struct JobQueue::OneShotDelayed
+    std::string TimerID::to_string() const
     {
-        JobQueue& jq;
-        std::function<void()> f;
+        return "Timer[{}]"_format(id);
+    }
+
+    struct JobQueue::Entry
+    {
+        // Used only by the dispatch callback, to dispose of a one-shot once it has fired.  ~Entry
+        // must never touch this: entries are destroyed by libevent finalizers, which can run from
+        // event_base_free *after* the JobQueue has been destroyed (it is declared after ev_loop in
+        // Loop, so it dies first).
+        JobQueue* jq;
+        TimerID id;
+
         event_ptr ev;
+        std::function<void()> f;
+        bool one_shot;
 
-        OneShotDelayed(JobQueue& jq_, std::function<void()> f) : jq{jq_}, f{std::move(f)} {}
+        Entry(JobQueue* jq, TimerID id, std::function<void()> f, bool one_shot) :
+                jq{jq}, id{id}, f{std::move(f)}, one_shot{one_shot}
+        {}
 
-        ~OneShotDelayed()
+        static void dispatch(evutil_socket_t, short, void* arg)
         {
-            if (ev)
-                event_del(ev.get());
+            auto* e = static_cast<Entry*>(arg);
+
+            try
+            {
+                e->f();
+            }
+            catch (const std::exception& ex)
+            {
+                log::warning(log_cat, "Timer callback raised an exception: {}", ex.what());
+            }
+            catch (...)
+            {
+                log::warning(log_cat, "Timer callback raised an unknown exception");
+            }
+
+            if (e->one_shot)
+                e->jq->remove(e->id);
+        }
+
+        // Disposes of an entry once nothing references it any more.  The last reference can be
+        // dropped from any thread, and in particular from inside the timer's own callback, so neither
+        // the event nor the std::function may be destroyed here: event_free_finalize hands both to
+        // libevent, which frees them at a point where it knows the callback is not running.
+        // Finalizers still pending when the loop goes away are run by event_base_free -- that is,
+        // the deletion happens; the timer's own callback is destroyed rather than given a last run.
+        static void dispose(Entry* e)
+        {
+            if (auto* ev = e->ev.release())
+                event_free_finalize(0, ev, [](::event*, void* arg) { delete static_cast<Entry*>(arg); });
+            else
+                delete e;
         }
     };
 
@@ -192,21 +239,34 @@ namespace oxen::quic
             return;
         }
 
-        std::lock_guard l{job_queue_mutex};
-        if (!job_waker)
-            return;
+        {
+            // Destroying a dropped job runs arbitrary code -- a captured callback's destructor,
+            // for instance -- which may want to touch this queue, so the jobs must be destroyed
+            // outside both of our mutexes.  (Why does std::queue not have a clear() method?)
+            std::queue<Job> dropped;
 
-        log::debug(log_cat, "Stopping/cancelling job queue events");
-        *running = false;
+            {
+                std::lock_guard l{job_queue_mutex};
+                if (!job_waker)
+                    return;
 
-        job_waker.reset();
+                log::debug(log_cat, "Stopping/cancelling job queue events");
+                *running = false;
 
-        // Why does std::queue not have a clear() method?
-        std::queue<Job>{}.swap(job_queue);
+                job_waker.reset();
 
-        for (auto* osd : delayed_events)
-            delete osd;
-        delayed_events.clear();
+                job_queue.swap(dropped);
+            }
+        }
+
+        // Dropping our references requests finalization of each timer's event; libevent runs those
+        // finalizers either during the loop's remaining iterations or, failing that, from
+        // event_base_free, so no entry is leaked by us going away first.  Note that finalization is
+        // only the *cleanup*: a timer that was armed or already woken has its callback destroyed
+        // here, not invoked.
+        std::lock_guard l{registry_mutex};
+        registry_stopped = true;
+        registry.clear();
     }
 
     Loop::~Loop()
@@ -277,36 +337,151 @@ namespace oxen::quic
         assert(job_waker);
     }
 
-    void JobQueue::add_oneshot_event(std::chrono::microseconds delay, std::function<void()> hook)
+    // Ids are never negative; -1 is the default-constructed "no timer" value.  Process-wide rather
+    // than per-queue so that an id from a dead or different queue is simply not found.
+    static std::atomic<int64_t> next_timer_id{0};
+
+    TimerID JobQueue::add_entry(std::chrono::microseconds interval, std::function<void()> f, bool one_shot)
     {
-        // lock if not in loop thread, to make running check safe -- most uses of this should be
-        // from the loop thread, so this shouldn't be a bottleneck
-        std::unique_lock l{job_queue_mutex, std::defer_lock};
-        if (!inside())
-            l.lock();
+        if (!f)
+            throw std::invalid_argument{"JobQueue: job callback must not be empty"};
 
-        if (!*running)
-            throw std::runtime_error{"Attempting to queue job onto stopped loop."};
+        std::shared_ptr<Entry> e;
+        TimerID id;
+        {
+            // The stopped check has to share a critical section with the insert to mean anything,
+            // so build the entry in here too rather than constructing an event we may throw away.
+            std::lock_guard lock{registry_mutex};
+            if (registry_stopped)
+                throw std::runtime_error{"Attempting to queue job onto stopped loop."};
 
-        auto* handler = new OneShotDelayed{*this, std::move(hook)};
-        delayed_events.push_back(handler);
-        auto& h = *handler;
-        const auto delay_tv = loop_time_to_timeval(delay);
-        h.ev.reset(event_new(
-                loop.get_event_base(),
-                -1,
-                0,
-                [](evutil_socket_t, short, void* e) mutable {
-                    auto* h = static_cast<OneShotDelayed*>(e);
-                    if (h->f)
-                        h->f();
-                    auto& de = h->jq.delayed_events;
-                    if (auto it = std::find(de.begin(), de.end(), h); it != de.end())
-                        de.erase(it);
-                    delete h;
-                },
-                &h));
-        event_add(h.ev.get(), &delay_tv);
+            id = TimerID{next_timer_id++};
+
+            e = std::shared_ptr<Entry>{new Entry{this, id, std::move(f), one_shot}, Entry::dispose};
+
+            e->ev.reset(event_new(loop.get_event_base(), -1, EV_PERSIST, Entry::dispatch, e.get()));
+            if (!e->ev)
+                throw std::runtime_error{"JobQueue: failed to create job event"};
+
+            registry.emplace(id, e);
+        }
+
+        // A one-shot always gets armed, even with a non-positive delay (libevent treats a zero
+        // timeout as "next loop iteration"), because it is disposed of by firing; a timer
+        // with no interval is simply left unarmed until something wakes or repeats it.
+        if (one_shot or interval > 0us)
+        {
+            auto tv = loop_time_to_timeval(std::max(interval, 0us));
+            event_add(e->ev.get(), &tv);
+        }
+
+        return id;
+    }
+
+    std::shared_ptr<JobQueue::Entry> JobQueue::find(TimerID id)
+    {
+        std::lock_guard lock{registry_mutex};
+        if (auto it = registry.find(id); it != registry.end())
+            return it->second;
+        return nullptr;
+    }
+
+    void JobQueue::disarm(Entry& e)
+    {
+        // libevent stores the repeat interval in the event itself (ev_io_timeout) and event_del
+        // does not clear it, so merely deleting leaves a timer that starts repeating again the
+        // instant it is next wake()d, because the persist closure re-arms from that stored value.
+        // Re-assigning with EV_PERSIST is what clears it.
+        //
+        // This event_del must stay blocking (i.e. not event_del_noblock): event_assign takes no base
+        // lock, so the only thing stopping it racing the loop thread is that event_del has already
+        // waited for any in-flight callback to finish.
+        event_del(e.ev.get());
+        event_assign(e.ev.get(), loop.get_event_base(), -1, EV_PERSIST, Entry::dispatch, &e);
+    }
+
+    void JobQueue::call_later(std::chrono::microseconds delay, std::function<void()> f)
+    {
+        add_entry(delay, std::move(f), true);
+    }
+
+    TimerID JobQueue::add_timer(std::chrono::microseconds interval, std::function<void()> f)
+    {
+        return add_entry(interval, std::move(f), false);
+    }
+
+    TimerID JobQueue::add_timer(std::function<void()> f)
+    {
+        return add_timer(0us, std::move(f));
+    }
+
+    TimerID JobQueue::add_wakeable(std::function<void()> f)
+    {
+        return add_timer(0us, std::move(f));
+    }
+
+    void JobQueue::wake(TimerID id)
+    {
+        auto e = find(id);
+        if (!e)
+            throw std::invalid_argument{"JobQueue::wake: no such job {}"_format(id)};
+
+        event_active(e->ev.get(), 0, 0);
+    }
+
+    void JobQueue::repeat(TimerID id, std::chrono::microseconds interval, bool now)
+    {
+        auto e = find(id);
+        if (!e)
+            throw std::invalid_argument{"JobQueue::repeat: no such job {}"_format(id)};
+
+        if (interval > 0us)
+        {
+            auto tv = loop_time_to_timeval(interval);
+            event_add(e->ev.get(), &tv);
+        }
+        else
+            disarm(*e);
+
+        if (now)
+            event_active(e->ev.get(), 0, 0);
+    }
+
+    bool JobQueue::armed(TimerID id)
+    {
+        auto e = find(id);
+        return e and event_pending(e->ev.get(), EV_TIMEOUT, nullptr) != 0;
+    }
+
+    bool JobQueue::stop(TimerID id)
+    {
+        auto e = find(id);
+        if (!e)
+            return false;
+
+        bool was_scheduled = event_pending(e->ev.get(), EV_TIMEOUT, nullptr) != 0;
+        disarm(*e);
+        return was_scheduled;
+    }
+
+    bool JobQueue::remove(TimerID id)
+    {
+        std::shared_ptr<Entry> e;
+        {
+            std::lock_guard lock{registry_mutex};
+            auto it = registry.find(id);
+            if (it == registry.end())
+                return false;
+            e = std::move(it->second);
+            registry.erase(it);
+        }
+
+        // The registry lock *must* already be released here: called from off the loop thread,
+        // event_del blocks until this timer's callback finishes, and that callback may itself want
+        // the registry (to wake another timer, or to dispose of itself if it is a one-shot).
+        event_del(e->ev.get());
+
+        return true;
     }
 
     void JobQueue::process_job_queue()
@@ -330,7 +505,21 @@ namespace oxen::quic
         {
             auto job = swapped_queue.front();
             swapped_queue.pop();
-            job();
+
+            // We are inside a libevent callback, so an escaping exception would unwind through C
+            // frames and terminate; one bad job also must not cost the rest of the queue its turn.
+            try
+            {
+                job();
+            }
+            catch (const std::exception& e)
+            {
+                log::warning(log_cat, "Queued job raised an exception: {}", e.what());
+            }
+            catch (...)
+            {
+                log::warning(log_cat, "Queued job raised an unknown exception");
+            }
         }
     }
 

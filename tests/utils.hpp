@@ -88,6 +88,12 @@ namespace oxen::quic
 
         static Connection* get_conn(std::shared_ptr<Endpoint>& ep, std::shared_ptr<Connection>& conn);
 
+        // Tears the connection down *synchronously*, rather than scheduling it the way
+        // Endpoint::drop_connection does.  Call it from inside a job already running on the loop to
+        // pin down the interleaving between teardown and other queued jobs, which is otherwise at
+        // the mercy of the order libevent happens to run two activated wakers in.
+        static void drop_connection_now(Endpoint& ep, Connection& conn, uint64_t ec);
+
         static UDPSocket::socket_t get_sock(Endpoint& ep);
     };
 
@@ -188,6 +194,15 @@ namespace oxen::quic
         {}
     };
 
+    // Multiplier for timing-sensitive intervals in tests.  Apple's scheduling overruns sleeps and
+    // timers badly enough on CI that durations tuned anywhere else are useless there; scale both
+    // the thing being waited for and the waiting by this.
+#ifdef __APPLE__
+    inline constexpr int apple_sucks_factor = 5;
+#else
+    inline constexpr int apple_sucks_factor = 1;
+#endif
+
 #define _require_future2(f, timeout) REQUIRE((f).wait_for(timeout) == std::future_status::ready)
 #define _require_future1(f) _require_future2((f), 1s)
 #define GET_REQUIRE_FUTURE_MACRO(_1, _2, NAME, ...) NAME
@@ -286,6 +301,31 @@ namespace oxen::quic
                 return val;
             std::this_thread::sleep_for(check_interval);
         }
+    }
+
+    /// Compares two potentially large byte sequences, returning an empty string if they match and a
+    /// short description of the first difference otherwise:
+    ///
+    ///     CHECK(bytes_diff(received, payload) == "");
+    ///
+    /// Use this rather than `CHECK(received == payload)` for anything bigger than a line or two.
+    /// Catch2 decomposes a comparison and prints *both* operands -- on success as well as on
+    /// failure -- so a pair of multi-megabyte payloads becomes tens of thousands of lines of log
+    /// that then has to live in the CI's database forever.
+    inline std::string bytes_diff(std::string_view actual, std::string_view expected)
+    {
+        if (actual.size() != expected.size())
+            return "sizes differ: got {}B, expected {}B"_format(actual.size(), expected.size());
+
+        auto [a, e] = std::mismatch(actual.begin(), actual.end(), expected.begin());
+        if (a == actual.end())
+            return "";
+
+        return "contents differ at offset {} of {}: got 0x{:02x}, expected 0x{:02x}"_format(
+                std::distance(actual.begin(), a),
+                actual.size(),
+                static_cast<unsigned char>(*a),
+                static_cast<unsigned char>(*e));
     }
 
     // Helper class for persistent zerortt storage.  This loads from disk on construction, and

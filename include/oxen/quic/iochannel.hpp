@@ -2,6 +2,7 @@
 
 #include "address.hpp"
 #include "connection_ids.hpp"
+#include "loop.hpp"
 #include "utils.hpp"
 
 #include <oxenc/common.h>
@@ -43,6 +44,16 @@ namespace oxen::quic
 
         Endpoint& endpoint;
         Loop& loop;
+
+        // This channel's own job queue, rather than the endpoint's: jobs queued here are cancelled
+        // when the channel is destroyed, so a deferred job may safely capture a raw `this`.  That
+        // guarantee requires the most-derived destructor to call `job_queue.stop()` before it
+        // touches anything those jobs reference, because this member (being in the base) is
+        // otherwise destroyed last of all.
+        //
+        // Mutable because scheduling work on the loop is not a modification of the channel's own
+        // state: the const accessors below dispatch through it to read that state.
+        mutable JobQueue job_queue;
 
         // The fixed Connection reference_id.  This will be the same as `get_conn()->reference_id`
         // while the connection exists, but persists even if the connection object gets destroyed.
@@ -114,15 +125,10 @@ namespace oxen::quic
         // Wraps an IOChannel (or derived type) accessor member function pointer in a call_get for
         // synchronous access that always returns by value (even if the member function returns by
         // reference).
-        template <
-                std::derived_from<IOChannel> Class,
-                typename T,
-                typename Ret = std::remove_cvref_t<T>,
-                typename EP = Endpoint>
+        template <std::derived_from<IOChannel> Class, typename T, typename Ret = std::remove_cvref_t<T>>
         Ret call_get_accessor(T (Class::*getter)() const) const
         {
-            return static_cast<EP&>(endpoint).job_queue.call_get(
-                    [this, &getter]() -> Ret { return (static_cast<const Class*>(this)->*getter)(); });
+            return job_queue.call_get([this, &getter]() -> Ret { return (static_cast<const Class*>(this)->*getter)(); });
         }
     };
 
