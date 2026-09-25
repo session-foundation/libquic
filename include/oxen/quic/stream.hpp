@@ -183,16 +183,24 @@ namespace oxen::quic
         // Returns the number of bytes that have been sent on the wire but not yet acked.
         size_t unacked_bytes() const;
 
-        // Returns a consistent snapshot of {acked, unacked, unsent} byte counts for the stream.
-        // This is equivalent to calling acked_bytes(), unacked_bytes(), and unsent() individually,
-        // but retrieves all three atomically in a single call.
+        // Returns the number of bytes of caller-provided buffers that this stream is still holding
+        // references to (and so has not yet released the keep-alives of).  Note that this can be
+        // *larger* than unacked_bytes() + unsent(): buffers are released only once fully acked, so
+        // a partially acked buffer stays retained in its entirety, including the acked portion.
+        size_t retained_bytes() const;
+
+        // Returns a consistent snapshot of {acked, unacked, unsent, retained} byte counts for the
+        // stream.  This is equivalent to calling acked_bytes(), unacked_bytes(), unsent(), and
+        // retained_bytes() individually, but retrieves all four atomically in a single call.
         // - acked: total bytes confirmed received by the remote (monotonically increasing)
         // - unacked: bytes written into QUIC packets but not yet acked
         // - unsent: bytes queued via send() but not yet written into QUIC packets
+        // - retained: bytes of caller buffers not yet released; see retained_bytes()
         // Useful derived values:
         // - acked + unacked + unsent = total bytes fed to the stream
         // - acked + unacked = total bytes sent on the wire
-        std::tuple<uint64_t, size_t, size_t> get_stats() const;
+        // - retained - unacked - unsent = acked bytes still pinned by a partially acked buffer
+        std::tuple<uint64_t, size_t, size_t, size_t> get_stats() const;
 
         // Returns true if the stream is writeable, i.e. not closing, shutdown and FIN not sent or
         // scheduled.
@@ -272,6 +280,9 @@ namespace oxen::quic
         virtual void wrote(size_t bytes);
 
       private:
+        // Event-loop-side implementation of retained_bytes(); see that method for what this counts.
+        size_t retained_impl() const { return _unacked_size + _unsent_size + _front_trimmed; }
+
         // Called if 0-RTT early data was rejected; marks all sent data as unsent
         void revert_stream();
 
@@ -294,8 +305,11 @@ namespace oxen::quic
         size_t _current_buffer_index{0};
         // Byte offset within user_buffers[_current_buffer_index] of the next unsent byte
         size_t _current_buffer_offset{0};
-        // Sum of all buffer sizes currently in user_buffers (sent + unsent, not yet freed by acks)
-        size_t _total_buffer_size{0};
+        // Acked bytes that have been trimmed off the front of user_buffers.front(), but whose
+        // keep-alive is still held because the rest of that buffer is unacked.  Only the front
+        // buffer can ever be trimmed (acks always consume the lowest unacked offset first), so a
+        // single counter suffices; it resets whenever the front buffer is released.
+        size_t _front_trimmed{0};
         // True once close() has been called on this stream
         bool _is_closing{false};
         // True once send_fin() has been called (FIN queued but possibly not yet sent)

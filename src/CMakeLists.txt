@@ -24,6 +24,7 @@ add_library(quic
     result.cpp
     stream.cpp
     udp.cpp
+    unencrypted.cpp
     utils.cpp
     ${CMAKE_CURRENT_BINARY_DIR}/version.cpp
 )

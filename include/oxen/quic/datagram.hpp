@@ -339,6 +339,8 @@ namespace oxen::quic
                 dgram_data_callback data_cb = nullptr,
                 size_t dgram_queue_limit = std::numeric_limits<size_t>::max());
 
+        ~Datagrams() override;
+
         Datagrams(const Datagrams&) = delete;
         Datagrams(Datagrams&&) = delete;
         Datagrams& operator=(const Datagrams&) = delete;
