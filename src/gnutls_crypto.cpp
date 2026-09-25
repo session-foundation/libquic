@@ -185,6 +185,14 @@ namespace oxen::quic
     {
         log::trace(log_cat, "Initializing GNUTLSCreds from Ed25519 keypair");
 
+        // The DER templates below have the key lengths baked into them (a 32-byte OCTET STRING for
+        // the seed, a 33-byte BIT STRING for the pubkey), so anything else produces malformed DER
+        // that gnutls rejects with an unhelpful import error.  Catch it here instead.
+        if (ed_seed.size() != GNUTLS_KEY_SIZE)
+            throw std::invalid_argument{"Ed25519 seed must be {} bytes, not {}"_format(GNUTLS_KEY_SIZE, ed_seed.size())};
+        if (ed_pubkey.size() != GNUTLS_KEY_SIZE)
+            throw std::invalid_argument{"Ed25519 pubkey must be {} bytes, not {}"_format(GNUTLS_KEY_SIZE, ed_pubkey.size())};
+
         constexpr auto pem_fmt = "-----BEGIN {0} KEY-----\n{1}\n-----END {0} KEY-----\n"sv;
 
         auto seed = x509_loader{
@@ -222,6 +230,16 @@ namespace oxen::quic
 
     std::shared_ptr<GNUTLSCreds> GNUTLSCreds::make_from_ed_keys(std::string_view seed, std::string_view pubkey)
     {
+        // A 64-byte libsodium secret key is the seed with the pubkey appended.  The constructor
+        // needs the bare 32-byte seed, so the tail comes off here; since it carries a pubkey of its
+        // own, disagreeing with the one we were passed is a caller error worth naming.
+        if (seed.size() == GNUTLS_SECRET_KEY_SIZE)
+        {
+            if (seed.substr(GNUTLS_KEY_SIZE) != pubkey)
+                throw std::invalid_argument{"Ed25519 pubkey does not match the public half of the given 64-byte secret key"};
+            seed = seed.substr(0, GNUTLS_KEY_SIZE);
+        }
+
         // would use make_shared, but I want GNUTLSCreds' constructor to be private
         std::shared_ptr<GNUTLSCreds> p{new GNUTLSCreds{seed, pubkey}};
         return p;

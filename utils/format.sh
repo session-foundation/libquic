@@ -20,7 +20,7 @@ if [ $? -ne 0 ]; then
 fi
 
 cd "$(dirname $0)/../"
-readarray -t sources < <(find include src tests | grep -E '\.([hc](pp)?)$' | grep -v '\#\|Catch2\|CLI11')
+readarray -t sources < <(find include src tests python | grep -E '\.([hc](pp)?)$' | grep -v '\#\|Catch2\|CLI11\|pybind11')
 if [ "$1" = "verify" ] ; then
     if [ $($binary --output-replacements-xml "${sources[@]}"  | grep '</replacement>' | wc -l) -ne 0 ] ; then
         exit 2
@@ -37,5 +37,16 @@ if [ $? -eq 0 ]; then
         fi
     else
         $jsonnet_format --in-place .drone.jsonnet
+    fi
+fi
+
+black_format=$(command -v black 2>/dev/null)
+if [ $? -eq 0 ]; then
+    if [ "$1" = "verify" ]; then
+        if ! $black_format --check --quiet python; then
+            exit 8
+        fi
+    else
+        $black_format --quiet python
     fi
 fi

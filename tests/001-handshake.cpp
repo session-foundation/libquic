@@ -33,6 +33,24 @@ namespace oxen::quic::test
             auto [client_tls, server_tls] = defaults::tls_creds_from_ed_keys();
             REQUIRE_NOTHROW(GNUTLSCreds::make_from_ed_keys(defaults::CLIENT_SEED, defaults::CLIENT_PUBKEY));
             REQUIRE_THROWS(GNUTLSCreds::make_from_ed_keys(""s, ""s));
+
+            const auto& seed = defaults::CLIENT_SEED;
+            const auto& pubkey = defaults::CLIENT_PUBKEY;
+            auto seckey = seed + pubkey;
+
+            // A 64-byte libsodium secret key is accepted in place of the seed.
+            CHECK_NOTHROW(GNUTLSCreds::make_from_ed_keys(seckey, pubkey));
+            CHECK_NOTHROW(GNUTLSCreds::make_from_ed_seckey(seckey));
+
+            // ... but only when the pubkey it carries is the one we were given.
+            CHECK_THROWS_AS(GNUTLSCreds::make_from_ed_keys(seckey, defaults::SERVER_PUBKEY), std::invalid_argument);
+
+            // Sizes other than 32 (or 64, for the seed) are rejected with a useful error rather
+            // than being handed to gnutls as malformed DER.
+            CHECK_THROWS_AS(GNUTLSCreds::make_from_ed_keys(seed.substr(0, 16), pubkey), std::invalid_argument);
+            CHECK_THROWS_AS(GNUTLSCreds::make_from_ed_keys(seed, pubkey.substr(0, 16)), std::invalid_argument);
+            CHECK_THROWS_AS(GNUTLSCreds::make_from_ed_keys(seed + seed + seed, pubkey), std::invalid_argument);
+            CHECK_THROWS_AS(GNUTLSCreds::make_from_ed_seckey(seed), std::invalid_argument);
         }
 
         SECTION("Address objects")

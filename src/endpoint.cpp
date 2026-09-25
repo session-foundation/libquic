@@ -21,9 +21,12 @@
 #include <chrono>
 #include <cstddef>
 #include <cstring>
+#include <future>
 #include <list>
+#include <memory>
 #include <numeric>
 #include <optional>
+#include <stdexcept>
 #include <string_view>
 #include <tuple>
 
@@ -225,6 +228,25 @@ namespace oxen::quic
         return ret;
     }
 
+    struct Endpoint::close_flush
+    {
+        std::promise<void> prom;
+
+        ~close_flush()
+        {
+            // Reachable from a destructor either way, so it must not throw; set_value can only fail
+            // here if the shared state is somehow already satisfied, which nothing else does.
+            try
+            {
+                prom.set_value();
+            }
+            catch (const std::future_error& e)
+            {
+                log::warning(log_cat, "Failed to signal close flush completion: {}", e.what());
+            }
+        }
+    };
+
     void Endpoint::close_conns(std::optional<Direction> d)
     {
         // We need to defer this because we aren't allowed to close connections during some other
@@ -235,7 +257,31 @@ namespace oxen::quic
         });
     }
 
-    void Endpoint::_close_conns(std::optional<Direction> d)
+    void Endpoint::close_conns(std::optional<Direction> d, std::chrono::microseconds wait)
+    {
+        if (wait <= 0us)
+            return close_conns(d);
+
+        if (job_queue.inside())
+            throw std::logic_error{"close_conns() with a wait cannot be called from the event loop thread"};
+
+        auto flush = std::make_shared<close_flush>();
+        auto fut = flush->prom.get_future();
+
+        // If the queue is stopped before this runs then the job is dropped rather than invoked,
+        // which destroys `flush` and releases us; that is why the wait below cannot hang.
+        job_queue.call_soon([wself = weak_from_this(), d, flush = std::move(flush)] {
+            if (auto self = wself.lock())
+                self->_close_conns(d, std::move(flush));
+        });
+
+        if (wait == std::chrono::microseconds::max())
+            fut.wait();
+        else
+            fut.wait_for(wait);
+    }
+
+    void Endpoint::_close_conns(std::optional<Direction> d, std::shared_ptr<close_flush> flush)
     {
         // We have to do this in two passes rather than just closing as we go because
         // `_close_connection` can remove from `conns`, invalidating our implicit iterator.
@@ -244,8 +290,11 @@ namespace oxen::quic
         for (const auto& c : conns)
             if (c.second && (!d || *d == c.second->direction()))
                 close_me.push_back(c.second.get());
+        // Our own `flush` reference is what stops the waiter being released in a gap between one
+        // connection's close packet completing and the next one being queued; it goes out of scope
+        // only once every close below has taken its own copy.
         for (auto* c : close_me)
-            _close_connection(*c, io_error{0}, "NO_ERROR");
+            _close_connection(*c, io_error{0}, "NO_ERROR", flush);
     }
 
     Endpoint::~Endpoint()
@@ -422,7 +471,7 @@ namespace oxen::quic
         return reinterpret_cast<uint8_t*>(c.data());
     }
 
-    void Endpoint::_close_connection(Connection& conn, io_error ec, std::string msg)
+    void Endpoint::_close_connection(Connection& conn, io_error ec, std::string msg, std::shared_ptr<close_flush> flush)
     {
         log::debug(log_cat, "Closing connection ({})", conn.reference_id());
 
@@ -496,15 +545,23 @@ namespace oxen::quic
         // A blocked send parks this callback on the socket until it becomes writeable, but the
         // cleanup scheduled just above is on a timer that does not wait for that: it can fire, and
         // destroy the connection, first.  Hence the id-and-lookup rather than capturing `conn`.
-        send_or_queue_packet(conn.path(), std::move(buf), /*ecn=*/0, [this, rid = conn.reference_id()](io_result rv) {
-            if (not rv.failure())
-                return;
+        send_or_queue_packet(
+                conn.path(),
+                std::move(buf),
+                /*ecn=*/0,
+                [this, rid = conn.reference_id(), flush = std::move(flush)](io_result rv) {
+                    if (not rv.failure())
+                        return;
 
-            log::warning(log_cat, "Error: failed to send close packet [{}]; removing connection ({})", rv.str_error(), rid);
+                    log::warning(
+                            log_cat,
+                            "Error: failed to send close packet [{}]; removing connection ({})",
+                            rv.str_error(),
+                            rid);
 
-            if (auto c = get_conn(rid))
-                delete_connection(*c);
-        });
+                    if (auto c = get_conn(rid))
+                        delete_connection(*c);
+                });
     }
 
     void Endpoint::delete_connection(Connection& conn)

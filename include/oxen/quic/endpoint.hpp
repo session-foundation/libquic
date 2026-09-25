@@ -119,6 +119,26 @@ namespace oxen::quic
 
         void close_conns(std::optional<Direction> d = std::nullopt);
 
+        /// Closes connections and then waits, up to `wait`, for their close packets to be handed to
+        /// the socket.  Without this the close packets are best-effort: one that the socket is not
+        /// ready to accept is queued, and then thrown away when the endpoint (and its socket) is
+        /// destroyed.
+        ///
+        /// A `wait` of 0 is identical to the non-waiting overload above, i.e. it queues the close
+        /// and returns; `microseconds::max()` waits indefinitely.  Expiry is not an error and needs
+        /// no handling: whatever has not flushed by then is dropped, exactly as it would be without
+        /// a wait at all.
+        ///
+        /// Note that this waits only for the close packets *this call* produces; a connection that
+        /// was already closing (from an idle timeout, say) is not waited on.
+        ///
+        /// Throws std::logic_error if called from the event loop thread with a non-zero wait, as
+        /// that would block the very thread that has to do the flushing.
+        void close_conns(std::optional<Direction> d, std::chrono::microseconds wait);
+
+        /// Equivalent to `close_conns(std::nullopt, wait)`.
+        void close_conns(std::chrono::microseconds wait) { close_conns(std::nullopt, wait); }
+
         std::shared_ptr<Connection> get_conn(ConnectionID rid);
 
         // Returns a random value suitable for use as the Endpoint static secret value.
@@ -305,9 +325,15 @@ namespace oxen::quic
 
         void _assign_context_globals(IOContext& ctx) const;
 
-        void _close_conns(std::optional<Direction> d);
+        // Keeps a close_conns(wait) caller blocked until every close packet it generated has been
+        // handed to the socket (or dropped).  A copy rides along with each close packet's send
+        // completion callback; the waiter is released when the last copy dies, which happens
+        // whether the callback fires or is thrown away with the socket.
+        struct close_flush;
 
-        void _close_connection(Connection& conn, io_error ec, std::string msg);
+        void _close_conns(std::optional<Direction> d, std::shared_ptr<close_flush> flush = nullptr);
+
+        void _close_connection(Connection& conn, io_error ec, std::string msg, std::shared_ptr<close_flush> flush = nullptr);
 
         void _execute_close_hooks(Connection& conn, io_error ec = io_error{0});
 
