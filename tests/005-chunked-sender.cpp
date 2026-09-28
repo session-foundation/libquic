@@ -99,7 +99,9 @@ namespace oxen::quic::test
                 },
                 parallel_chunks);
 
-        require_future(finished_f);
+        // The stream is opened without waiting for the handshake, so one lost packet costs a ~1s
+        // ngtcp2 retransmit timeout before the data can arrive.
+        require_future(finished_f, 5s);
 
         {
             std::lock_guard lock{recv_mut};
