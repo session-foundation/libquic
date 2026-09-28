@@ -1,3 +1,20 @@
+oxen-libquic (1.9.1-1) unstable; urgency=medium
+
+  [ Audric Ackermann ]
+  * Fix use-after-free in Endpoint::drop_connection's deferred job
+
+  [ Jason Rhinelander ]
+  * Review fixes: assert on close callbacks in drop-twice test
+  * Give test 005 more time to receive its data
+  * Move the drop-twice test into 001
+  * Move the 019 destruction tests into 002 and 007
+  * Add a tests readme on where new tests belong
+  * Test a close packet send failing after connection cleanup
+  * Revert "Test a close packet send failing after connection cleanup"
+  * version bump (1.9.1)
+
+ -- Jason Rhinelander <jason@session.foundation>  Mon, 28 Sep 2026 17:21:03 -0300
+
 oxen-libquic (1.9.0-1) unstable; urgency=medium
 
   * Add credentials that disable encryption entirely
