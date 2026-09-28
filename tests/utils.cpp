@@ -92,6 +92,16 @@ namespace oxen::quic
         ep._drop_connection(conn, io_error{ec});
     }
 
+    void TestHelper::drop_connection(Endpoint& ep, Connection& conn, io_error err)
+    {
+        ep.drop_connection(conn, std::move(err));
+    }
+
+    void TestHelper::pump(Endpoint& ep)
+    {
+        ep.job_queue.call_get([] {});
+    }
+
     void TestHelper::enable_dgram_drop(Connection& ci)
     {
         auto& conn = static_cast<Connection&>(ci);

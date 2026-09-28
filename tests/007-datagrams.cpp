@@ -696,4 +696,39 @@ namespace oxen::quic::test
         REQUIRE(drop_count_2 > drop_count);
     }
 
+    TEST_CASE("007 - Datagram support: queued datagram discarded with its channel", "[007][datagrams][destruction]")
+    {
+        // The datagram half of the per-channel job queue.  There is no callback to observe here:
+        // the failure mode is a use-after-free inside the queued send, so this is a crash test,
+        // and only really earns its keep under a sanitizer.
+        Network net{};
+        auto [client_tls, server_tls] = defaults::tls_creds_from_ed_keys();
+
+        auto server_ep = net.endpoint(Address{}, opt::enable_datagrams{});
+        server_ep->listen(server_tls);
+
+        auto client_ep = net.endpoint(Address{}, opt::enable_datagrams{});
+        auto conn =
+                client_ep->connect(RemoteAddress{defaults::SERVER_PUBKEY, LOCALHOST, server_ep->local().port()}, client_tls);
+
+        // Must be fetched before parking the loop: Connection::datagrams() is a call_get, which
+        // would block the test thread against the very loop we are about to park.
+        auto dgrams = conn->datagrams();
+
+        auto* ep = client_ep.get();
+        auto* cptr = conn.get();
+        parked_loop parked{client_ep->loop, [ep, cptr] { TestHelper::drop_connection_now(*ep, *cptr, 12345); }};
+
+        dgrams->send("dropped on the floor"s);
+
+        dgrams.reset();
+        conn.reset();
+        parked.release();
+        REQUIRE(parked.wait());
+
+        // Give the loop a chance to run the discarded job, if it wrongly still holds one.
+        std::this_thread::sleep_for(250ms);
+        SUCCEED();
+    }
+
 }  // namespace oxen::quic::test
