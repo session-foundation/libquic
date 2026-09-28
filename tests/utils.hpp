@@ -95,6 +95,12 @@ namespace oxen::quic
         static void drop_connection_now(Endpoint& ep, Connection& conn, uint64_t ec);
 
         static UDPSocket::socket_t get_sock(Endpoint& ep);
+
+        static void drop_connection(Endpoint& ep, Connection& conn, io_error err);
+
+        // Blocks until every job already queued on the endpoint's job queue has run.  Jobs that
+        // those jobs queue in turn may or may not have run by the time this returns.
+        static void pump(Endpoint& ep);
     };
 
     namespace test::defaults
@@ -302,6 +308,39 @@ namespace oxen::quic
             std::this_thread::sleep_for(check_interval);
         }
     }
+
+    /// Parks the event loop on a job that blocks until release() is called, so that the test thread
+    /// can queue work and tear things down in a known order.  While it is parked nothing is
+    /// processed, and calls from the test thread that defer to the loop (e.g. command()) are queued
+    /// rather than run inline.  `during` runs on the loop thread, after the release, before anything
+    /// queued in the meantime gets a turn; do teardown there, via the synchronous TestHelper entry
+    /// points, to have it strictly ordered before those queued jobs.
+    ///
+    /// Anything that needs the loop -- a call_get, or a deleter that dispatches to the loop -- will
+    /// deadlock against it while parked, so fetch what you need beforehand and make sure the last
+    /// references released while parked are not ones that destroy anything.
+    struct parked_loop
+    {
+        std::promise<void> gate;
+        std::promise<void> done;
+        std::future<void> finished{done.get_future()};
+
+        parked_loop(Loop& loop, std::function<void()> during)
+        {
+            loop.call_soon([this, during = std::move(during)] {
+                gate.get_future().wait();
+                during();
+                done.set_value();
+            });
+        }
+
+        void release() { gate.set_value(); }
+
+        [[nodiscard]] bool wait(std::chrono::milliseconds timeout = 5s)
+        {
+            return finished.wait_for(timeout) == std::future_status::ready;
+        }
+    };
 
     /// Compares two potentially large byte sequences, returning an empty string if they match and a
     /// short description of the first difference otherwise:

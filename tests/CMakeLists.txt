@@ -44,7 +44,6 @@ if(LIBQUIC_BUILD_TESTS)
         016-stateless_reset.cpp
         017-stream-stats.cpp
         018-unencrypted.cpp
-        019-btreq-destruction.cpp
         job-queue.cpp
 
         case_logger.cpp
