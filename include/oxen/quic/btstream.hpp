@@ -30,12 +30,30 @@ namespace oxen::quic
     // timeout is used for sent requests awaiting responses
     inline constexpr std::chrono::seconds DEFAULT_TIMEOUT{10s};
 
-    // request sizes
-    inline constexpr long long MAX_REQ_LEN = 10_M;
+    // The default limit on the size of a bt-encoded request or response frame; see
+    // opt::max_request_size.
+    inline constexpr size_t DEFAULT_MAX_REQ_LEN = 10_Mi;
+
+    // Any limit has to be below this, so that the length prefix of a frame within it has at most
+    // MAX_REQ_LEN_ENCODED digits.
+    inline constexpr size_t MAX_REQ_LEN_LIMIT = 1'000'000'000;
 
     // maximum length of the bencoded request length string that we parse, including the `:`.  This
-    // must be at least as large as needed to hold `MAX_REQ_LEN` followed by a `:`.
+    // must be at least as large as needed to hold any permitted limit followed by a `:`.
     inline constexpr size_t MAX_REQ_LEN_ENCODED = 10;  // "999999999:"
+
+    namespace opt
+    {
+        // BTRequestStream constructor option: the largest bt-encoded request or response frame the
+        // stream will send or accept, in bytes.  Sending a larger one throws; receiving one closes
+        // the stream.  Both ends of a stream therefore have to agree on it, and it defaults to
+        // DEFAULT_MAX_REQ_LEN.  Must be positive and below MAX_REQ_LEN_LIMIT.
+        struct max_request_size
+        {
+            size_t size;
+            explicit max_request_size(size_t bytes) : size{bytes} {}
+        };
+    }  // namespace opt
 
     class BTRequestStream;
 
@@ -252,6 +270,9 @@ namespace oxen::quic
 
         size_t current_len{0};
 
+        // The frame size limit; see opt::max_request_size.
+        size_t max_req_len{DEFAULT_MAX_REQ_LEN};
+
         std::atomic<int64_t> next_rid{0};
 
         event_ptr timeout;
@@ -339,6 +360,10 @@ namespace oxen::quic
         /// Returns the number of sent requests awaiting response
         size_t num_awaiting_response() const;
 
+        /// The largest bt-encoded frame this stream sends or accepts, in bytes; see
+        /// opt::max_request_size.
+        size_t max_request_size() const { return max_req_len; }
+
       protected:
         void check_timeouts(std::optional<std::chrono::steady_clock::time_point> now);
         void update_timeout();
@@ -351,6 +376,8 @@ namespace oxen::quic
         // Optional constructor argument: generic request handler.  Providing it in the constructor
         // is equivalent to calling register_command_fallback() with the lambda.
         void handle_opt(std::function<void(message m)> request_handler);
+
+        void handle_opt(opt::max_request_size limit);
 
         using Stream::handle_opt;
 
@@ -379,7 +406,7 @@ namespace oxen::quic
             req_time{get_time()},
             expiry{req_time}
     {
-        if (total_len > MAX_REQ_LEN)
+        if (total_len > bp.max_req_len)
             throw std::invalid_argument{"Request body too long!"};
 
         ((void)handle_req_opts(std::forward<Opt>(opts)), ...);
