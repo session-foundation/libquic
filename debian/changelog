@@ -1,3 +1,9 @@
+oxen-libquic (1.10.0-1~ubuntu2610) stonking; urgency=medium
+
+  * Stonking deb
+
+ -- Jason Rhinelander <jason@session.foundation>  Tue, 29 Sep 2026 16:31:46 -0300
+
 oxen-libquic (1.10.0-1~ubuntu2604) resolute; urgency=medium
 
   * Give the JobQueue tests' waits room on slow machines
