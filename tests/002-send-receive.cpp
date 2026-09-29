@@ -581,7 +581,10 @@ namespace oxen::quic::test
 
         SECTION("Too huge")
         {
-            std::string req_msg(10'000'000, 'a');
+            // Both ends of the stream get a limit small enough to test cheaply.  The bt encoding
+            // adds a length prefix, so a body of exactly the limit is over it.
+            constexpr size_t limit = 100'000;
+            std::string req_msg(limit, 'a');
 
             auto server_handler = [&](message) mutable {
                 REQUIRE(false);  // Should not get here!
@@ -595,7 +598,7 @@ namespace oxen::quic::test
             };
 
             stream_constructor_callback server_constructor = [&](Connection& c, Endpoint& e, std::optional<int64_t>) {
-                auto s = e.loop.make_shared<BTRequestStream>(c, e);
+                auto s = e.loop.make_shared<BTRequestStream>(c, e, opt::max_request_size{limit});
                 s->register_handler(TEST_ENDPOINT, server_handler);
                 return s;
             };
@@ -610,7 +613,9 @@ namespace oxen::quic::test
 
             SECTION("Send failure")
             {
-                std::shared_ptr<BTRequestStream> client_bp = conn_interface->open_stream<BTRequestStream>();
+                std::shared_ptr<BTRequestStream> client_bp =
+                        conn_interface->open_stream<BTRequestStream>(opt::max_request_size{limit});
+                CHECK(client_bp->max_request_size() == limit);
                 CHECK_THROWS_WITH(
                         client_bp->command(TEST_ENDPOINT, req_msg, client_reply_handler), "Request body too long!");
             }
@@ -631,6 +636,74 @@ namespace oxen::quic::test
                 REQUIRE(stream_close_cb.wait());
                 CHECK(close_err.load() == BTREQ_ERROR_EXCEPTION);
             }
+
+            SECTION("Limit too large to encode")
+            {
+                CHECK_THROWS_WITH(
+                        conn_interface->open_stream<BTRequestStream>(opt::max_request_size{1'000'000'000}),
+                        "max_request_size must be positive and below 1000000000");
+                CHECK_THROWS_WITH(
+                        conn_interface->open_stream<BTRequestStream>(opt::max_request_size{0}),
+                        "max_request_size must be positive and below 1000000000");
+            }
+
+            SECTION("Length prefix longer than any limit can need")
+            {
+                // Rejected on the digits alone, before any body arrives
+                std::string payload = "99999999999:li123e1:C3:abce";
+
+                std::atomic<uint64_t> close_err = -1;
+                auto stream_close_cb = callback_waiter{[&](Stream&, uint64_t error_code) { close_err = error_code; }};
+                auto str = conn_interface->open_stream<Stream>(stream_close_cb);
+
+                str->send(std::move(payload));
+
+                REQUIRE(stream_close_cb.wait());
+                CHECK(close_err.load() == BTREQ_ERROR_EXCEPTION);
+            }
+        }
+
+        SECTION("Default limit admits a 10 MB request")
+        {
+            // The limit used to be a fixed 10'000'000 bytes; the default is now 10 MiB.
+            std::string req_msg(10'000'001, 'a');
+            CHECK(req_msg.size() < DEFAULT_MAX_REQ_LEN);
+
+            std::promise<void> prom;
+            auto done = prom.get_future();
+            std::atomic<size_t> received_size = 0;
+
+            auto server_handler = [&](message m) {
+                received_size = m.body().size();
+                m.respond("ok"s);
+            };
+
+            auto client_reply_handler = [&](message msg) {
+                CHECK(msg);
+                CHECK(msg.body() == "ok"sv);
+                prom.set_value();
+            };
+
+            stream_constructor_callback server_constructor = [&](Connection& c, Endpoint& e, std::optional<int64_t>) {
+                auto s = e.loop.make_shared<BTRequestStream>(c, e);
+                s->register_handler(TEST_ENDPOINT, server_handler);
+                return s;
+            };
+
+            auto server_endpoint = test_net.endpoint(server_local);
+            REQUIRE_NOTHROW(server_endpoint->listen(server_tls, server_constructor));
+
+            RemoteAddress client_remote{defaults::SERVER_PUBKEY, LOCALHOST, server_endpoint->local().port()};
+
+            auto client_endpoint = test_net.endpoint(client_local);
+            auto conn_interface = client_endpoint->connect(client_remote, client_tls);
+
+            auto client_bp = conn_interface->open_stream<BTRequestStream>();
+            CHECK(client_bp->max_request_size() == DEFAULT_MAX_REQ_LEN);
+            client_bp->command(TEST_ENDPOINT, req_msg, client_reply_handler);
+
+            require_future(done, 30s);
+            CHECK(received_size == req_msg.size());
         }
     }
 
