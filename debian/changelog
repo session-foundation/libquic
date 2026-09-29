@@ -1,3 +1,11 @@
+oxen-libquic (1.10.0-1~deb13) trixie; urgency=medium
+
+  * Give the JobQueue tests' waits room on slow machines
+  * Make the BTRequestStream frame size limit configurable; default 10 MiB
+  * Bump version to 1.10.0
+
+ -- Jason Rhinelander <jason@session.foundation>  Tue, 29 Sep 2026 15:23:34 -0300
+
 oxen-libquic (1.9.1-1~deb13) trixie; urgency=medium
 
   [ Audric Ackermann ]
