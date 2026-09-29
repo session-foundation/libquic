@@ -103,6 +103,12 @@ namespace oxen::quic
         log::debug(log_cat, "BTRequestStream set generic request handler");
         generic_handler = std::move(request_handler);
     }
+    void BTRequestStream::handle_opt(opt::max_request_size limit)
+    {
+        if (limit.size == 0 || limit.size >= MAX_REQ_LEN_LIMIT)
+            throw std::invalid_argument{"max_request_size must be positive and below {}"_format(MAX_REQ_LEN_LIMIT)};
+        max_req_len = limit.size;
+    }
     void BTRequestStream::respond(int64_t rid, std::span<const std::byte> body, bool error)
     {
         log::trace(log_cat, "{} called", __PRETTY_FUNCTION__);
@@ -361,7 +367,7 @@ namespace oxen::quic
                         log::debug(log_cat, "Ignoring 0-length btstream body");
                         return;
                     }
-                    if (current_len > MAX_REQ_LEN)
+                    if (current_len > max_req_len)
                         throw std::invalid_argument{"Request exceeds maximum size!"};
                 }
                 else
