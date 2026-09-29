@@ -47,11 +47,11 @@ namespace oxen::quic::test
                 queued.call();
             });
 
-            REQUIRE(queued.wait(10ms));
+            REQUIRE(queued.wait());
 
-            REQUIRE(good.wait(10ms));
+            REQUIRE(good.wait());
             REQUIRE_FALSE(bad.wait(10ms));
-            REQUIRE(main_ok.wait(10ms));
+            REQUIRE(main_ok.wait());
         }
 
         SECTION("call exception if invoked after JobQueue stopped")
@@ -84,7 +84,7 @@ namespace oxen::quic::test
                 stopped.call();
             });
 
-            CHECK_NOFAIL(stopped.wait(10ms));
+            REQUIRE(stopped.wait());
 
             REQUIRE(soon_failed);
             REQUIRE(later_failed);
