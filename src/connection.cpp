@@ -826,6 +826,12 @@ namespace oxen::quic
             return;
         }
 
+        if (dead)
+        {
+            log::debug(log_cat, "Note: connection {} has failed and is being closed; dropping", reference_id());
+            return;
+        }
+
         if (read_packet(pkt).success())
             log::trace(log_cat, "done with incoming packet");
         else
@@ -838,6 +844,11 @@ namespace oxen::quic
         log::trace(log_cat, "Calling ngtcp2_conn_read_pkt...");
         auto data = pkt.data<uint8_t>();
         auto rv = ngtcp2_conn_read_pkt(*this, pkt.path, &pkt.pkt_info, data.data(), data.size(), ts);
+
+        if (rv != 0 && rv != NGTCP2_ERR_DRAINING)
+            // Every other error means the connection has to be closed (or dropped), which the
+            // cases below schedule; nothing may call into ngtcp2 for it in the meantime.
+            dead = true;
 
         switch (rv)
         {
@@ -1048,6 +1059,9 @@ namespace oxen::quic
 
     void Connection::on_packet_io_ready()
     {
+        if (dead)
+            return;
+
         auto ts = get_time();
         flush_packets(ts);
 
@@ -1148,6 +1162,9 @@ namespace oxen::quic
 
     void Connection::flush_packets(std::chrono::steady_clock::time_point tp)
     {
+        if (dead)
+            return;
+
         // Maximum number of stream data packets to send out at once; if we reach this then we'll
         // schedule another event loop call of ourselves (so that we don't starve the loop)
         const auto max_udp_payload_size = ngtcp2_conn_get_path_max_tx_udp_payload_size(*this);
@@ -1352,12 +1369,24 @@ namespace oxen::quic
 
             if (nwrite < 0)
             {
-                if (ngtcp2_err_is_fatal(nwrite))
+                // The errors a write can return and leave the connection usable are the ones its
+                // documentation lists; anything else means the connection has to be closed, and
+                // ngtcp2 must not be called for it again before that happens.  (This is not the
+                // same as ngtcp2_err_is_fatal(), which covers only out-of-memory and a failed
+                // callback.)
+                const bool recoverable =
+                        is_stream ? nwrite == NGTCP2_ERR_WRITE_MORE || nwrite == NGTCP2_ERR_STREAM_DATA_BLOCKED ||
+                                            nwrite == NGTCP2_ERR_STREAM_NOT_FOUND || nwrite == NGTCP2_ERR_STREAM_SHUT_WR
+                                  : nwrite == NGTCP2_ERR_WRITE_MORE || nwrite == NGTCP2_ERR_INVALID_STATE ||
+                                            nwrite == NGTCP2_ERR_INVALID_ARGUMENT;
+                if (!recoverable)
                 {
                     log::warning(
                             log_cat,
-                            "Fatal ngtcp2 error: could not write frame - \"{}\" - closing connection...",
+                            "ngtcp2 error writing packet on {}: {}; closing connection",
+                            reference_id(),
                             ngtcp2_strerror(nwrite));
+                    dead = true;
                     _endpoint.close_connection(*this, io_error{(int)nwrite});
                     return;
                 }
@@ -2160,9 +2189,12 @@ namespace oxen::quic
                 0,
                 [](evutil_socket_t, short, void* self_) {
                     auto& self = *static_cast<Connection*>(self_);
+                    if (self.dead)
+                        return;
                     if (auto rv = ngtcp2_conn_handle_expiry(self, get_timestamp().count()); rv != 0)
                     {
                         log::debug(log_cat, "Error: expiry handler invocation returned error code: {}", ngtcp2_strerror(rv));
+                        self.dead = true;
                         self.endpoint().close_connection(self, io_error{rv});
                         return;
                     }
