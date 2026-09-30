@@ -408,12 +408,17 @@ namespace oxen::quic
             };
 
             chunk_sender(Stream& s, chunk_callback_t next, done_callback_t done) :
-                    str{s}, next_chunk{std::move(next)}, done{std::move(done)}
+                    str{s.std::enable_shared_from_this<Stream>::weak_from_this()},
+                    next_chunk{std::move(next)},
+                    done{std::move(done)}
             {
                 assert(next_chunk);
             }
 
-            Stream& str;
+            // Weak: the chunks in flight are owned by the stream's send buffers, so their
+            // destructors run while the stream is being destroyed (and when it is closed with
+            // data pending), and must not then reach back into it or into the application.
+            std::weak_ptr<Stream> str;
             chunk_callback_t next_chunk;
             done_callback_t done;
 
@@ -424,7 +429,16 @@ namespace oxen::quic
                     // We already finished (i.e. via a previous chunk destructor)
                     return;
 
-                auto data = next_chunk(const_cast<const Stream&>(str));
+                auto stream = str.lock();
+                if (!stream || stream->_is_closing)
+                {
+                    // The stream is gone or closing: nothing more can be sent, and the
+                    // application gets neither another chunk request nor `done`.
+                    next_chunk = nullptr;
+                    return;
+                }
+
+                auto data = next_chunk(const_cast<const Stream&>(*stream));
                 bool no_data = false;
                 if constexpr (is_pointer)
                     no_data = !data || data->size() == 0;
@@ -439,7 +453,7 @@ namespace oxen::quic
                     // We're finishing
                     next_chunk = nullptr;
                     if (done)
-                        done(str);
+                        done(*stream);
                     return;
                 }
 
@@ -448,7 +462,7 @@ namespace oxen::quic
 #ifndef NDEBUG
                 _chunk_sender_trace(__FILE__, __LINE__, "got chunk to send of size ", bsv.size());
 #endif
-                str.send(bsv, std::move(next));
+                stream->send(bsv, std::move(next));
             }
         };
 
@@ -457,7 +471,8 @@ namespace oxen::quic
         /// with a const reference to the stream instance as needed to obtain the next chunk of data
         /// until it returns an empty container, at which point `done(stream)` will be called.
         /// Chunks are called when a previous chunk has been completely send and acknolwedged by the
-        /// other end of the stream.
+        /// other end of the stream.  If the stream is closed or destroyed before the data runs
+        /// out, no further chunks are requested and `done` is not called.
         ///
         /// next_chunk() can return any contiguous container with `.data()` and `.size()` member
         /// functions as long as `.data()` returns a pointer to a single-byte type (e.g.

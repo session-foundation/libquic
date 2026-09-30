@@ -521,6 +521,10 @@ int main(int argc, char* argv[])
         fmt::print("\n\n\n");
     }
 
+    // The streams' deleters run on the endpoint's job queue, so they have to go before the
+    // endpoint does; `streams` is declared above it and would otherwise be destroyed after it.
+    streams.clear();
+
     return 0;
 }
 
