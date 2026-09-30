@@ -1369,6 +1369,14 @@ namespace oxen::quic
 
             if (nwrite < 0)
             {
+                if (nwrite == NGTCP2_ERR_CLOSING || nwrite == NGTCP2_ERR_DRAINING)
+                {
+                    // Not an error: the connection is already ending and nothing more can be
+                    // sent on it.
+                    log::debug(log_cat, "{} is {}; nothing to write", reference_id(), ngtcp2_strerror(nwrite));
+                    return;
+                }
+
                 // The errors a write can return and leave the connection usable are the ones its
                 // documentation lists; anything else means the connection has to be closed, and
                 // ngtcp2 must not be called for it again before that happens.  (This is not the
