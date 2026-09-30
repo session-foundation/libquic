@@ -1,3 +1,12 @@
+oxen-libquic (1.10.1-1~deb13) trixie; urgency=medium
+
+  * Don't request chunks from a stream that is closing or gone
+  * speedtest-client: release the streams before the endpoint
+  * Stop using a connection once ngtcp2 has rejected it
+  * version bump for ngtcp2 assert fix
+
+ -- Jason Rhinelander <jason@session.foundation>  Tue, 29 Sep 2026 22:06:40 -0300
+
 oxen-libquic (1.10.0-1~deb13) trixie; urgency=medium
 
   * Give the JobQueue tests' waits room on slow machines
