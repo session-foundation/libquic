@@ -1,3 +1,10 @@
+oxen-libquic (1.10.2-1~ubuntu2204) jammy; urgency=medium
+
+  * Writing to a closing or draining connection is not an error
+  * Version bump to 1.10.2
+
+ -- Jason Rhinelander <jason@session.foundation>  Wed, 30 Sep 2026 13:34:10 -0300
+
 oxen-libquic (1.10.1-1~ubuntu2204) jammy; urgency=medium
 
   * Don't request chunks from a stream that is closing or gone
