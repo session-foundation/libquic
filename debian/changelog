@@ -1,3 +1,9 @@
+oxen-libquic (1.10.2-2~deb13) trixie; urgency=medium
+
+  * Depend on at least the ngtcp2 we built against
+
+ -- Jason Rhinelander <jason@session.foundation>  Wed, 30 Sep 2026 20:28:10 -0300
+
 oxen-libquic (1.10.2-1~deb13) trixie; urgency=medium
 
   * Writing to a closing or draining connection is not an error
