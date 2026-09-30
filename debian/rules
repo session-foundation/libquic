@@ -31,6 +31,17 @@ override_dh_auto_configure:
 override_dh_auto_test:
 	./obj-$(DEB_BUILD_GNU_TYPE)/tests/alltests --log-level warning --no-ipv6 --disable-0rtt --colour-mode ansi
 
+# ngtcp2's symbols file only records when each function first appeared, so
+# ${shlibs:Depends} only asks for >= 1.1.0.  But the *_versioned calls pass the
+# struct versions (NGTCP2_SETTINGS_VERSION, NGTCP2_CALLBACKS_VERSION, ...) of the
+# headers we build against, and an older libngtcp2 that doesn't know those
+# versions crashes, so depend on at least the ngtcp2 we built with.  (No error
+# if it's missing: `clean` may run where the build-deps aren't installed.)
+NGTCP2_VERSION := $(shell dpkg-query -W -f='$${source:Upstream-Version}' libngtcp2-dev 2>/dev/null)
+
+override_dh_gencontrol:
+	dh_gencontrol -- -Vngtcp2:Version=$(NGTCP2_VERSION)
+
 # dh_make generated override targets
 # This is example for Cmake (See https://bugs.debian.org/641051 )
 #override_dh_auto_configure:
