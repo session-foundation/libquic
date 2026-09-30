@@ -477,6 +477,12 @@ namespace oxen::quic
         void check_established();
         bool establish_hook_called = false;
 
+        // Set when ngtcp2 returns an error that requires the connection to be closed.  The
+        // close is deferred (we learn of the error inside the connection's own packet and timer
+        // callbacks), and ngtcp2 must not be called for the connection in the meantime: its
+        // state may be inconsistent (a failed loss-detection pass, for one), and it asserts.
+        bool dead = false;
+
         // Invokes the stream_construct_cb, if present; if not present, or if it returns nullptr,
         // then the given `make_stream` gets invoked to create a default stream.
         std::shared_ptr<Stream> construct_stream(
