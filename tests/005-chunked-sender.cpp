@@ -110,4 +110,65 @@ namespace oxen::quic::test
                     "Goodbye.");
         }
     }
+
+    // The chunks in flight are owned by the stream's send buffers, and each one's destructor asks
+    // for the next chunk.  When the stream is closed or destroyed with chunks pending, that must
+    // not call back into the application (whose state may be gone) nor into the stream.
+    TEST_CASE("005 - Chunked stream sending: stream closed mid-send", "[005][chunked][close]")
+    {
+        Network test_net{};
+
+        std::atomic<size_t> received = 0;
+        std::promise<void> some_received_p;
+        auto some_received_f = some_received_p.get_future();
+        stream_data_callback server_data_cb = [&](Stream&, std::span<const std::byte> data) {
+            if (received.fetch_add(data.size()) == 0)
+                some_received_p.set_value();
+        };
+
+        auto [client_tls, server_tls] = defaults::tls_creds_from_ed_keys();
+
+        Address server_local{};
+        Address client_local{};
+
+        auto server_endpoint = test_net.endpoint(server_local);
+        REQUIRE_NOTHROW(server_endpoint->listen(server_tls, server_data_cb));
+
+        RemoteAddress client_remote{defaults::SERVER_PUBKEY, LOCALHOST, server_endpoint->local().port()};
+
+        auto client_endpoint = test_net.endpoint(client_local);
+        auto conn_interface = client_endpoint->connect(client_remote, client_tls);
+
+        std::atomic<bool> closed = false;
+        std::atomic<bool> chunk_after_close = false, done_called = false;
+        std::atomic<int> chunks = 0;
+        auto stream = conn_interface->open_stream<Stream>();
+
+        // Never runs out of data
+        stream->send_chunks(
+                [&](const Stream&) {
+                    if (closed)
+                        chunk_after_close = true;
+                    chunks++;
+                    return std::string(1000, 'x');
+                },
+                [&](Stream&) { done_called = true; },
+                4);
+
+        require_future(some_received_f, 5s);
+        CHECK(chunks >= 4);
+
+        // On the loop, so that the stream is closing by the time this returns
+        client_endpoint->loop.call_get([&] { stream->close(0); });
+        closed = true;
+
+        conn_interface->close_connection();
+        stream.reset();
+        conn_interface.reset();
+        client_endpoint.reset();
+        server_endpoint.reset();
+
+        CHECK_FALSE(chunk_after_close);
+        CHECK_FALSE(done_called);
+    }
 }  // namespace oxen::quic::test
