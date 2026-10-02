@@ -697,8 +697,9 @@ namespace oxen::quic::test
 
         Network test_net{};
 
+        // Only touched on the loop thread: both are assigned in one loop job (below), so the key
+        // verify callbacks that read them can't run until both are set.
         std::shared_ptr<Connection> server_ci, client_ci;
-        std::mutex ci_mutex;
 
         auto client_tls = GNUTLSCreds::make_from_ed_keys(C_SEED, C_PUBKEY);
         auto server_tls = GNUTLSCreds::make_from_ed_keys(S_SEED, S_PUBKEY);
@@ -726,12 +727,10 @@ namespace oxen::quic::test
         };
 
         server_tls->require_client_keys([&](std::span<const unsigned char> key, std::string_view) {
-            std::lock_guard lock{ci_mutex};
             return defer_hook(view(key), S_PUBKEY, C_PUBKEY, server_ci);
         });
 
         client_tls->require_client_keys([&](std::span<const unsigned char> key, std::string_view) {
-            std::lock_guard lock{ci_mutex};
             return defer_hook(view(key), C_PUBKEY, S_PUBKEY, client_ci);
         });
 
@@ -761,11 +760,10 @@ namespace oxen::quic::test
             server_endpoint->listen(server_tls);
             client_endpoint->listen(client_tls);
 
-            {
-                std::lock_guard lock{ci_mutex};
+            test_net.loop()->call_get([&] {
                 client_ci = client_endpoint->connect(client_remote, client_tls);
                 server_ci = server_endpoint->connect(server_remote, server_tls);
-            }
+            });
 
             CHECK(client_established.wait());
 
@@ -794,11 +792,10 @@ namespace oxen::quic::test
             server_endpoint->listen(server_tls);
             client_endpoint->listen(client_tls);
 
-            {
-                std::lock_guard lock{ci_mutex};
+            test_net.loop()->call_get([&] {
                 client_ci = client_endpoint->connect(client_remote, client_tls);
                 server_ci = server_endpoint->connect(server_remote, server_tls, server_closed_conn_level);
-            }
+            });
 
             CHECK(client_established.wait());
             client_endpoint->close_conns();

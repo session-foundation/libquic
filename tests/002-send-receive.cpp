@@ -1,6 +1,8 @@
 #include "unit_test.hpp"
 
 #include <atomic>
+#include <map>
+#include <mutex>
 
 namespace oxen::quic::test
 {
@@ -972,5 +974,331 @@ namespace oxen::quic::test
         std::this_thread::sleep_for(250ms);
 
         CHECK(resp.calls == 1);
+    }
+
+    TEST_CASE("002 - Each packet in a batch is sent with its own ECN marking", "[002][ecn]")
+    {
+        // Equal-sized packets, so that only the differing ECN values can keep GSO from sending
+        // them all as a single batch.
+        const bool allow_gso = GENERATE(false, true);
+        const auto localhost = GENERATE("127.0.0.1"s, "::1"s);
+        constexpr std::array<uint8_t, 6> ecns{0, 2, 2, 0, 1, 3};
+
+        Loop loop;
+        std::vector<std::pair<int, uint8_t>> received;  // (packet index, ecn); loop thread only
+        std::promise<void> all_received;
+        std::unique_ptr<UDPSocket> sender, receiver;
+
+        loop.call_get([&] {
+            receiver = std::make_unique<UDPSocket>(
+                    loop.get_event_base(), Address{localhost, 0}, false, [&](Packet&& pkt) {
+                        received.emplace_back(static_cast<int>(pkt.data()[0]), pkt.pkt_info.ecn);
+                        if (received.size() == ecns.size())
+                            all_received.set_value();
+                    });
+            sender = std::make_unique<UDPSocket>(
+                    loop.get_event_base(), Address{localhost, 0}, allow_gso, [](Packet&&) {});
+
+            std::array<std::byte, 100 * ecns.size()> bufs;
+            std::array<size_t, ecns.size()> sizes;
+            for (size_t i = 0; i < ecns.size(); i++)
+            {
+                std::fill_n(bufs.begin() + 100 * i, 100, static_cast<std::byte>(i));
+                sizes[i] = 100;
+            }
+            auto [res, sent] =
+                    sender->send(Path{sender->address(), receiver->address()}, bufs.data(), sizes.data(), ecns.data(), ecns.size());
+            REQUIRE(res.success());
+            REQUIRE(sent == ecns.size());
+        });
+
+        require_future(all_received.get_future());
+
+        loop.call_get([&] {
+            for (size_t i = 0; i < received.size(); i++)
+            {
+                CHECK(received[i].first == static_cast<int>(i));
+                CHECK(received[i].second == ecns[i]);
+            }
+            sender.reset();
+            receiver.reset();
+        });
+    }
+
+    TEST_CASE("002 - A blocked socket stalls the endpoint's sends until it clears", "[002][stall]")
+    {
+        Network test_net{};
+
+        constexpr int n_conns = 3;
+        std::vector<std::byte> msg(100'000);
+        for (size_t i = 0; i < msg.size(); i++)
+            msg[i] = static_cast<std::byte>(i % 251);
+
+        std::mutex received_mut;
+        std::map<Stream*, std::vector<std::byte>> received;
+        int complete = 0;
+        std::promise<void> all_received;
+        stream_data_callback server_data_cb = [&](Stream& s, std::span<const std::byte> dat) {
+            std::lock_guard lock{received_mut};
+            auto& r = received[&s];
+            r.insert(r.end(), dat.begin(), dat.end());
+            if (r.size() == msg.size() && ++complete == n_conns)
+                all_received.set_value();
+        };
+
+        std::atomic<int> established{0};
+        std::promise<void> all_established;
+        connection_established_callback client_established = [&](Connection&) {
+            if (++established == n_conns)
+                all_established.set_value();
+        };
+
+        auto [client_tls, server_tls] = defaults::tls_creds_from_ed_keys();
+
+        auto server_endpoint = test_net.endpoint(Address{});
+        REQUIRE_NOTHROW(server_endpoint->listen(server_tls, server_data_cb));
+        RemoteAddress server_remote{defaults::SERVER_PUBKEY, LOCALHOST, server_endpoint->local().port()};
+
+        // All of the connections share one client endpoint, and so one send batch.
+        auto client_endpoint = test_net.endpoint(Address{}, client_established);
+        std::vector<std::shared_ptr<Connection>> conns;
+        for (int i = 0; i < n_conns; i++)
+            conns.push_back(client_endpoint->connect(server_remote, client_tls));
+        require_future(all_established.get_future());
+
+        if (!TestHelper::block_sends_for(*client_endpoint, 250ms))
+            SKIP("Send stall testing requires a debug build of libquic");
+
+        std::vector<std::shared_ptr<Stream>> streams;
+        for (auto& c : conns)
+        {
+            streams.push_back(c->open_stream());
+            streams.back()->send(msg, nullptr);
+        }
+
+        require_future(all_received.get_future(), 5s);
+        {
+            std::lock_guard lock{received_mut};
+            for (auto& [s, r] : received)
+                CHECK(r == msg);
+        }
+
+        auto stats = TestHelper::stall_counts(*client_endpoint);
+        CHECK(stats.stalls >= 1);
+        // A waiting connection only retries its flush when something new wakes it (incoming
+        // packets, new data to send, an already-armed timer); anything that kept re-waking waiters
+        // during the stall would instead show up here as a skip on every loop iteration, which over
+        // the 250ms stall is thousands of times.
+        CHECK(stats.skips < 50);
+        CHECK(stats.discards == 0);
+    }
+
+    TEST_CASE("002 - A stalled batch is discarded if its connection goes away", "[002][stall]")
+    {
+        Network test_net{};
+
+        std::vector<std::byte> msg(10'000);
+        for (size_t i = 0; i < msg.size(); i++)
+            msg[i] = static_cast<std::byte>(i % 251);
+
+        std::mutex received_mut;
+        std::map<Stream*, std::vector<std::byte>> received;
+        std::promise<void> one_received;
+        stream_data_callback server_data_cb = [&](Stream& s, std::span<const std::byte> dat) {
+            std::lock_guard lock{received_mut};
+            auto& r = received[&s];
+            r.insert(r.end(), dat.begin(), dat.end());
+            if (r.size() == msg.size())
+                one_received.set_value();
+        };
+
+        std::atomic<int> established{0};
+        std::promise<void> both_established;
+        connection_established_callback client_established = [&](Connection&) {
+            if (++established == 2)
+                both_established.set_value();
+        };
+
+        auto [client_tls, server_tls] = defaults::tls_creds_from_ed_keys();
+
+        auto server_endpoint = test_net.endpoint(Address{});
+        REQUIRE_NOTHROW(server_endpoint->listen(server_tls, server_data_cb));
+        RemoteAddress server_remote{defaults::SERVER_PUBKEY, LOCALHOST, server_endpoint->local().port()};
+
+        auto client_endpoint = test_net.endpoint(Address{}, client_established);
+        auto conn_a = client_endpoint->connect(server_remote, client_tls);
+        auto conn_b = client_endpoint->connect(server_remote, client_tls);
+        require_future(both_established.get_future());
+
+        if (!TestHelper::block_sends_for(*client_endpoint, 300ms))
+            SKIP("Send stall testing requires a debug build of libquic");
+
+        // A's first send blocks, so A's packets (all it ever gets to send) are the stalled batch.
+        auto stream_a = conn_a->open_stream();
+        stream_a->send(msg, nullptr);
+        REQUIRE(wait_for([&] { return TestHelper::stall_counts(*client_endpoint).stalls == 1; }, 200ms, 1ms));
+
+        auto stream_b = conn_b->open_stream();
+        stream_b->send(msg, nullptr);
+        REQUIRE(wait_for([&] { return TestHelper::stall_counts(*client_endpoint).skips >= 1; }, 200ms, 1ms));
+
+        SECTION("owner closed during the stall")
+        {
+            conn_a->close_connection();
+            REQUIRE(wait_for(
+                    [&] { return client_endpoint->job_queue.call_get([&] { return conn_a->is_closing(); }); },
+                    200ms,
+                    1ms));
+        }
+        SECTION("owner died during the stall")
+        {
+            TestHelper::mark_dead(*conn_a);
+        }
+
+        // B was waiting on the stall, so it gets woken (and sends) once the socket unblocks.
+        require_future(one_received.get_future(), 5s);
+        std::this_thread::sleep_for(100ms);
+
+        CHECK(TestHelper::stall_counts(*client_endpoint).discards == 1);
+        {
+            std::lock_guard lock{received_mut};
+            REQUIRE(received.size() == 1);
+            CHECK(received.begin()->second == msg);
+        }
+
+        conn_a->close_connection();
+    }
+
+    TEST_CASE("002 - A partly sent batch keeps its unsent packets intact", "[002][stall][partial]")
+    {
+        // Different sizes so that the unsent packets have to be moved by the right byte offset.
+        constexpr std::array<size_t, 6> sizes{100, 200, 150, 300, 120, 80};
+        constexpr std::array<uint8_t, 6> ecns{0, 2, 2, 0, 1, 3};
+
+        Network test_net{};
+        auto ep = test_net.endpoint(Address{LOCALHOST, 0});
+
+        if (!TestHelper::partial_sends(*ep, 1, 2))
+            SKIP("Partial send testing requires a debug build of libquic");
+
+        struct received_pkt
+        {
+            int index;
+            size_t size;
+            uint8_t ecn;
+            bool intact;
+        };
+        std::vector<received_pkt> received;  // loop thread only
+        std::promise<void> all_received;
+        std::unique_ptr<UDPSocket> receiver;
+        test_net.loop()->call_get([&] {
+            receiver = std::make_unique<UDPSocket>(
+                    test_net.loop()->get_event_base(), Address{LOCALHOST, 0}, false, [&](Packet&& pkt) {
+                        auto d = pkt.data();
+                        auto index = static_cast<int>(d[0]);
+                        bool intact = std::all_of(d.begin(), d.end(), [&](std::byte b) { return b == d[0]; });
+                        received.push_back({index, d.size(), pkt.pkt_info.ecn, intact});
+                        if (received.size() == sizes.size())
+                            all_received.set_value();
+                    });
+        });
+
+        std::vector<std::byte> buf;
+        std::array<size_t, 6> bufsize = sizes;
+        std::array<uint8_t, 6> ecn = ecns;
+        for (size_t i = 0; i < sizes.size(); i++)
+            buf.insert(buf.end(), sizes[i], static_cast<std::byte>(i));
+
+        Path path{ep->local(), test_net.loop()->call_get([&] { return receiver->address(); })};
+        size_t n = sizes.size();
+
+        auto res = TestHelper::send_packets(*ep, path, buf.data(), bufsize.data(), ecn.data(), n);
+        CHECK(res.blocked());
+        REQUIRE(n == 4);
+        for (size_t i = 0; i < n; i++)
+        {
+            CHECK(bufsize[i] == sizes[i + 2]);
+            CHECK(ecn[i] == ecns[i + 2]);
+        }
+        CHECK(buf[0] == std::byte{2});
+        CHECK(buf[sizes[2]] == std::byte{3});
+
+        res = TestHelper::send_packets(*ep, path, buf.data(), bufsize.data(), ecn.data(), n);
+        CHECK(res.success());
+        CHECK(n == 0);
+
+        require_future(all_received.get_future());
+        test_net.loop()->call_get([&] {
+            for (size_t i = 0; i < received.size(); i++)
+            {
+                CHECK(received[i].index == static_cast<int>(i));
+                CHECK(received[i].size == sizes[i]);
+                CHECK(received[i].ecn == ecns[i]);
+                CHECK(received[i].intact);
+            }
+            receiver.reset();
+        });
+    }
+
+    TEST_CASE("002 - Streams survive repeatedly partly sent batches", "[002][stall][partial]")
+    {
+        Network test_net{};
+
+        constexpr int n_conns = 2;
+        std::vector<std::byte> msg(100'000);
+        for (size_t i = 0; i < msg.size(); i++)
+            msg[i] = static_cast<std::byte>(i % 251);
+
+        std::mutex received_mut;
+        std::map<Stream*, std::vector<std::byte>> received;
+        int complete = 0;
+        std::promise<void> all_received;
+        stream_data_callback server_data_cb = [&](Stream& s, std::span<const std::byte> dat) {
+            std::lock_guard lock{received_mut};
+            auto& r = received[&s];
+            r.insert(r.end(), dat.begin(), dat.end());
+            if (r.size() == msg.size() && ++complete == n_conns)
+                all_received.set_value();
+        };
+
+        std::atomic<int> established{0};
+        std::promise<void> all_established;
+        connection_established_callback client_established = [&](Connection&) {
+            if (++established == n_conns)
+                all_established.set_value();
+        };
+
+        auto [client_tls, server_tls] = defaults::tls_creds_from_ed_keys();
+
+        auto server_endpoint = test_net.endpoint(Address{});
+        REQUIRE_NOTHROW(server_endpoint->listen(server_tls, server_data_cb));
+        RemoteAddress server_remote{defaults::SERVER_PUBKEY, LOCALHOST, server_endpoint->local().port()};
+
+        auto client_endpoint = test_net.endpoint(Address{}, client_established);
+        std::vector<std::shared_ptr<Connection>> conns;
+        for (int i = 0; i < n_conns; i++)
+            conns.push_back(client_endpoint->connect(server_remote, client_tls));
+        require_future(all_established.get_future());
+
+        if (!TestHelper::partial_sends(*client_endpoint, 30, 5))
+            SKIP("Partial send testing requires a debug build of libquic");
+
+        std::vector<std::shared_ptr<Stream>> streams;
+        for (auto& c : conns)
+        {
+            streams.push_back(c->open_stream());
+            streams.back()->send(msg, nullptr);
+        }
+
+        require_future(all_received.get_future(), 5s);
+        {
+            std::lock_guard lock{received_mut};
+            for (auto& [s, r] : received)
+                CHECK(r == msg);
+        }
+
+        auto stats = TestHelper::stall_counts(*client_endpoint);
+        CHECK(stats.stalls >= 1);
+        CHECK(stats.discards == 0);
     }
 }  // namespace oxen::quic::test

@@ -114,7 +114,8 @@ namespace oxen::quic
         /// number of packets that were actually sent (between 0 and n_pkts).
         ///
         /// Payloads should be packed sequentially starting at `bufs` with the length of each
-        /// payload given by the `bufsize` array.  The given ecn value will be used for the packets.
+        /// payload given by the `bufsize` array, and the ECN value of each packet given by the `ecn`
+        /// array.
         ///
         /// If not all packets could be sent because the socket would block it is up to the caller
         /// to deal with it: if such a block occurs it is always the first `n` packets that will
@@ -125,7 +126,7 @@ namespace oxen::quic
         /// retry however much of the send is remaining (via resend()) and, once the send is fully
         /// completed, resuming creation of new packets.
         std::pair<io_result, size_t> send(
-                const Path& path, const std::byte* bufs, const size_t* bufsize, uint8_t ecn, size_t n_pkts);
+                const Path& path, const std::byte* bufs, const size_t* bufsize, const uint8_t* ecn, size_t n_pkts);
 
         /// Queues a callback to invoke when the UDP socket becomes writeable again.
         ///

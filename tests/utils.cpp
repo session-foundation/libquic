@@ -87,6 +87,32 @@ namespace oxen::quic
         return ep.get_socket()->sock_;
     }
 
+    bool TestHelper::block_sends_for(Endpoint& ep, std::chrono::milliseconds duration)
+    {
+        return ep.job_queue.call_get([&] { return ep._debug_block_sends_for(duration); });
+    }
+
+    bool TestHelper::partial_sends(Endpoint& ep, size_t n_sends, size_t max_pkts)
+    {
+        return ep.job_queue.call_get([&] { return ep._debug_partial_sends(n_sends, max_pkts); });
+    }
+
+    io_result TestHelper::send_packets(
+            Endpoint& ep, const Path& path, std::byte* buf, size_t* bufsize, uint8_t* ecn, size_t& n_pkts)
+    {
+        return ep.job_queue.call_get([&] { return ep.send_packets(path, buf, bufsize, ecn, n_pkts); });
+    }
+
+    Endpoint::debug_stall_stats TestHelper::stall_counts(Endpoint& ep)
+    {
+        return ep.job_queue.call_get([&] { return ep._debug_stall_counts(); });
+    }
+
+    void TestHelper::mark_dead(Connection& conn)
+    {
+        conn._endpoint.job_queue.call_get([&] { conn.dead = true; });
+    }
+
     void TestHelper::drop_connection_now(Endpoint& ep, Connection& conn, uint64_t ec)
     {
         ep._drop_connection(conn, io_error{ec});
@@ -659,7 +685,8 @@ namespace oxen::quic
                         break;
                     log::debug(log_cat, "completing outgoing delayed delivery of {}B packet along {}", data.size(), path);
                     size_t sz = data.size();
-                    auto [res, sent] = self.sock->send(path, data.data(), &sz, 0, 1);
+                    uint8_t ecn = 0;
+                    auto [res, sent] = self.sock->send(path, data.data(), &sz, &ecn, 1);
                     if (sent != 1)
                         log::critical(
                                 log_cat,

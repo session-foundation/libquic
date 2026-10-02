@@ -744,6 +744,9 @@ namespace oxen::quic
         assert(_endpoint.job_queue.inside());
         packet_io_trigger.reset();
         packet_retransmit_timer.reset();
+        // We can't flush again after this, so mustn't be woken by, or own, a send stall.  (This
+        // rather than the destructor because a Connection can outlive its Endpoint).
+        _endpoint.forget_send_stall(*this);
         log::debug(log_cat, "Connection ({}) io trigger/retransmit timer events halted", reference_id());
     }
 
@@ -1063,7 +1066,11 @@ namespace oxen::quic
             return;
 
         auto ts = get_time();
-        flush_packets(ts);
+        if (!flush_packets(ts))
+            // Stalled on a blocked socket: we get woken once it clears, and re-arm the timer then.
+            // Until then the timer couldn't let us send anything, and holding it off also keeps
+            // loss detection from running against packets that are only stuck locally.
+            return;
 
         // If we get a failure (e.g. io error) during flush_packets we might have initiated a
         // shutdown which would have deleted and reset the timer (in which case we don't want to try
@@ -1098,53 +1105,38 @@ namespace oxen::quic
         }
     };
 
-    // Sends the current `n_packets` packets queued in `send_buffer` with individual lengths
-    // `send_buffer_size`.
+    // Sends the packets in the endpoint's send batch.
     //
     // Returns true if the caller can keep on sending, false if the caller should return
     // immediately (i.e. because either an error occured or the socket is blocked).
     //
-    // In the case where the socket is blocked, this sets up an event to wait for it to become
-    // unblocked, at which point we'll re-enter flush_packets (which will finish off the pending
-    // packets before continuing).
-    //
-    // If pkt_updater is provided then we cancel it when an error (other than a block) occurs.
-    bool Connection::send(pkt_tx_timer_updater* pkt_updater)
+    // In the case where the socket is blocked, the unsent packets stay in the batch and the
+    // endpoint stalls it until the socket is writable again, finishes sending them, and then wakes
+    // us (and anyone else who wanted to send in the meantime).
+    bool Connection::send(pkt_tx_timer_updater& pkt_updater)
     {
         log::trace(log_cat, "{} called", __PRETTY_FUNCTION__);
-        assert(n_packets > 0 && n_packets <= MAX_BATCH);
+        auto& b = _endpoint.batch();
+        assert(b.n_packets > 0 && b.n_packets <= MAX_BATCH);
 
         if (debug_datagram_counter_enabled)
         {
-            debug_datagram_counter += n_packets;
+            debug_datagram_counter += b.n_packets;
             log::debug(log_cat, "enable_datagram_counter_test is true; sent packet count: {}", debug_datagram_counter);
         }
 
-        auto rv = endpoint().send_packets(_path, send_buffer.data(), send_buffer_size.data(), send_ecn, n_packets);
+        auto rv = _endpoint.send_packets(_path, b.buf.data(), b.size.data(), b.ecn.data(), b.n_packets);
 
         if (rv.blocked())
         {
-            assert(n_packets > 0);  // n_packets, buf, bufsize now contain the unsent packets
-            log::debug(log_cat, "Packet send blocked; queuing re-send");
-
-            _endpoint.get_socket()->when_writeable([&ep = _endpoint, connid = reference_id(), this] {
-                if (!ep.conns.count(connid))
-                    return;  // Connection has gone away (and so `this` isn't valid!)
-
-                if (send(nullptr))
-                {  // Send finished so we can start our timers up again
-                    packet_io_ready();
-                }
-                // Otherwise we're still blocked (or an error occured)
-            });
-
+            log::debug(log_cat, "Packet send blocked; stalling until the socket is writable");
+            _endpoint.stall_send(*this);
             return false;
         }
         else if (rv.failure())
         {
             log::warning(log_cat, "Error while trying to send packet: {}", rv.str_error());
-            if (pkt_updater)
-                pkt_updater->cancel();
+            pkt_updater.cancel();
 
             log::debug(log_cat, "Endpoint deleting {}", reference_id());
             _endpoint.drop_connection(*this, io_error{CONN_SEND_FAIL});
@@ -1160,25 +1152,43 @@ namespace oxen::quic
     // is predictable, we just want to shuffle it.
     thread_local std::mt19937 stream_start_rng{};
 
-    void Connection::flush_packets(std::chrono::steady_clock::time_point tp)
+    bool Connection::flush_packets(std::chrono::steady_clock::time_point tp)
     {
         if (dead)
-            return;
+            return true;
+
+        auto& b = _endpoint.batch();
+        if (b.stalled)
+        {
+            // The socket is blocked with packets (ours or another connection's) still waiting to
+            // go out, so nothing could be sent anyway; we'll be woken once that clears.
+            log::debug(log_cat, "Skipping this flush_packets call; endpoint send batch is stalled");
+            _endpoint.wait_for_send_stall(*this);
+            return false;
+        }
+        assert(b.n_packets == 0);
+
+#ifndef NDEBUG
+        // Flushes share the endpoint's batch, so one must never start inside another, and every
+        // exit must leave the batch either empty or stalled.
+        assert(!b.in_use);
+        b.in_use = true;
+        struct batch_guard
+        {
+            send_batch& b;
+            ~batch_guard()
+            {
+                assert(b.n_packets == 0 || b.stalled);
+                b.in_use = false;
+            }
+        } guard{b};
+#endif
 
         // Maximum number of stream data packets to send out at once; if we reach this then we'll
         // schedule another event loop call of ourselves (so that we don't starve the loop)
         const auto max_udp_payload_size = ngtcp2_conn_get_path_max_tx_udp_payload_size(*this);
         const auto max_stream_packets = ngtcp2_conn_get_send_quantum(*this) / max_udp_payload_size;
         auto ts = static_cast<uint64_t>(std::chrono::nanoseconds{tp.time_since_epoch()}.count());
-
-        if (n_packets > 0)
-        {
-            // We're blocked from a previous call, and haven't finished sending all our packets yet
-            // so there's nothing to do for now (once the packets are fully sent we'll get called
-            // again so that we can keep working on sending).
-            log::debug(log_cat, "Skipping this flush_packets call; we still have {} queued packets", n_packets);
-            return;
-        }
 
         std::list<IOChannel*> channels;
         if (!_streams.empty())
@@ -1226,7 +1236,7 @@ namespace oxen::quic
         auto streams_end_it = std::prev(channels.end());
 
         ngtcp2_pkt_info pkt_info{};
-        auto* buf_pos = reinterpret_cast<uint8_t*>(send_buffer.data());
+        auto* buf_pos = reinterpret_cast<uint8_t*>(b.buf.data());
         pkt_tx_timer_updater pkt_updater{*this, ts};
         size_t stream_packets = 0;
 
@@ -1234,7 +1244,7 @@ namespace oxen::quic
 
         while (!channels.empty())
         {
-            log::trace(log_cat, "Creating packet {} of max {} batch stream packets", n_packets, MAX_BATCH);
+            log::trace(log_cat, "Creating packet {} of max {} batch stream packets", b.n_packets, MAX_BATCH);
             bool datagram_waiting = false;
             ngtcp2_ssize nwrite = 0;
             ngtcp2_ssize ndatalen;
@@ -1372,9 +1382,10 @@ namespace oxen::quic
                 if (nwrite == NGTCP2_ERR_CLOSING || nwrite == NGTCP2_ERR_DRAINING)
                 {
                     // Not an error: the connection is already ending and nothing more can be
-                    // sent on it.
+                    // sent on it, including anything already written into the batch.
                     log::debug(log_cat, "{} is {}; nothing to write", reference_id(), ngtcp2_strerror(nwrite));
-                    return;
+                    b.n_packets = 0;
+                    return true;
                 }
 
                 // The errors a write can return and leave the connection usable are the ones its
@@ -1396,7 +1407,8 @@ namespace oxen::quic
                             ngtcp2_strerror(nwrite));
                     dead = true;
                     _endpoint.close_connection(*this, io_error{(int)nwrite});
-                    return;
+                    b.n_packets = 0;
+                    return true;
                 }
                 if (nwrite == NGTCP2_ERR_WRITE_MORE)
                 {
@@ -1433,18 +1445,18 @@ namespace oxen::quic
 
             // success
             buf_pos += nwrite;
-            send_buffer_size[n_packets++] = nwrite;
-            send_ecn = pkt_info.ecn;
+            b.ecn[b.n_packets] = pkt_info.ecn;
+            b.size[b.n_packets++] = nwrite;
             stream_packets++;
 
-            if (n_packets == MAX_BATCH)
+            if (b.n_packets == MAX_BATCH)
             {
                 log::trace(log_cat, "Sending stream data packet batch");
-                if (!send(&pkt_updater))
-                    return;
+                if (!send(pkt_updater))
+                    return !b.stalled;
 
-                assert(n_packets == 0);
-                buf_pos = reinterpret_cast<uint8_t*>(send_buffer.data());
+                assert(b.n_packets == 0);
+                buf_pos = reinterpret_cast<uint8_t*>(b.buf.data());
             }
 
             if (stream_packets == max_stream_packets)
@@ -1478,12 +1490,13 @@ namespace oxen::quic
             }
         }
 
-        if (n_packets > 0)
+        if (b.n_packets > 0)
         {
-            log::trace(log_cat, "Sending final packet batch of {} packets", n_packets);
-            send(&pkt_updater);
+            log::trace(log_cat, "Sending final packet batch of {} packets", b.n_packets);
+            send(pkt_updater);
         }
         log::debug(log_cat, "Exiting flush_packets()");
+        return !b.stalled;
     }
 
     void Connection::schedule_packet_retransmit(std::chrono::steady_clock::time_point ts)

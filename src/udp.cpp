@@ -343,7 +343,11 @@ namespace oxen::quic
         receive_callback_(Packet{bound_, payload, hdr});
     }
 
-    union alignas(cmsghdr) recv_cmsg_data
+    // This needs room for every control message we enable on the socket at once: the kernel
+    // silently drops whichever ones don't fit (setting MSG_CTRUNC), and Linux delivers pktinfo
+    // before the TOS/TCLASS ECN value, so undersizing this loses the ECN value on every packet.
+    // (Dual-stack Windows sockets deliver both pktinfo types).
+    struct alignas(cmsghdr) recv_cmsg_data
     {
         char ecn[CMSG_SPACE(sizeof(int))];  // a char most places but an int on windows because yay
         char pktinfo4[CMSG_SPACE(sizeof(in_pktinfo))];
@@ -527,7 +531,7 @@ namespace oxen::quic
 #endif
 
     std::pair<io_result, size_t> UDPSocket::send(
-            const Path& path, const std::byte* buf, const size_t* bufsize, uint8_t ecn, size_t n_pkts)
+            const Path& path, const std::byte* buf, const size_t* bufsize, const uint8_t* ecn, size_t n_pkts)
     {
         auto* next_buf = const_cast<char*>(reinterpret_cast<const char*>(buf));
         int rv = 0;
@@ -577,10 +581,11 @@ namespace oxen::quic
         {
 
             // With GSO, we use *one* sendmmsg call which can contain multiple batches of packets; each
-            // batch is of size n, where each of the n have the same size.
+            // batch is of size n, where each of the n have the same size and ECN value (the ECN cmsg
+            // applies to every segment of the batch).
             //
             // We could have up to the full MAX_BATCH, with the worst case being every packet being a
-            // different size than the one before it.
+            // different size or ECN value than the one before it.
             alignas(cmsghdr) std::array<
                     std::array<
                             char,
@@ -602,7 +607,7 @@ namespace oxen::quic
                 if (gso_size == 0)
                     gso_size = bufsize[i];  // new batch
 
-                if (i < n_pkts - 1 && bufsize[i + 1] == gso_size)
+                if (i < n_pkts - 1 && bufsize[i + 1] == gso_size && ecn[i + 1] == ecn[i])
                     continue;  // The next one can be batched with us
 
                 auto& iov = iovs[msg_count];
@@ -621,7 +626,7 @@ namespace oxen::quic
                 hdr.msg_controllen = control.size();
 
                 auto* cm = CMSG_FIRSTHDR(&hdr);
-                size_t actual_size = set_ecn_cmsg(cm, ecn, source_ipv4);
+                size_t actual_size = set_ecn_cmsg(cm, ecn[i], source_ipv4);
 
                 if (set_source_addr)
                 {
@@ -717,7 +722,7 @@ namespace oxen::quic
             hdr.msg_controllen = control.size();
 
             auto* cm = CMSG_FIRSTHDR(&hdr);
-            size_t actual_size = set_ecn_cmsg(cm, ecn, source_ipv4);
+            size_t actual_size = set_ecn_cmsg(cm, ecn[i], source_ipv4);
 
             if (set_source_addr)
             {
@@ -764,27 +769,28 @@ namespace oxen::quic
         hdr.msg_control = control.data();
         auto& hdr_msg_controllen = hdr.msg_controllen;
 #endif
-        hdr_msg_controllen = control.size();
-
-        auto* cm = CMSG_FIRSTHDR(&hdr);
-
-        size_t actual_size = set_ecn_cmsg(cm, ecn, remote.is_ipv4() || remote.is_ipv4_mapped_ipv6());
-
-        if (set_source_addr)
-        {
-            cm = CMSG_NXTHDR(&hdr, cm);
-            cm->cmsg_level = source_cmsg_level;
-            cm->cmsg_type = source_cmsg_type;
-            cm->cmsg_len = CMSG_LEN(source_addrlen);
-            std::memcpy(QUIC_CMSG_DATA(cm), &source_addr, source_addrlen);
-            actual_size += CMSG_SPACE(source_addrlen);
-        }
-
-        hdr_msg_controllen = actual_size;
+        const bool ecn_ipv4 = remote.is_ipv4() || remote.is_ipv4_mapped_ipv6();
 
         for (size_t i = 0; i < n_pkts; ++i)
         {
             assert(bufsize[i] > 0);
+
+            hdr_msg_controllen = control.size();
+            auto* cm = CMSG_FIRSTHDR(&hdr);
+
+            size_t actual_size = set_ecn_cmsg(cm, ecn[i], ecn_ipv4);
+
+            if (set_source_addr)
+            {
+                cm = CMSG_NXTHDR(&hdr, cm);
+                cm->cmsg_level = source_cmsg_level;
+                cm->cmsg_type = source_cmsg_type;
+                cm->cmsg_len = CMSG_LEN(source_addrlen);
+                std::memcpy(QUIC_CMSG_DATA(cm), &source_addr, source_addrlen);
+                actual_size += CMSG_SPACE(source_addrlen);
+            }
+
+            hdr_msg_controllen = actual_size;
 #ifdef _WIN32
             iov.buf = next_buf;
             iov.len = bufsize[i];

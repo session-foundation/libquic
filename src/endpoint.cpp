@@ -134,8 +134,15 @@ namespace oxen::quic
         job_queue.call_soon([this, packet = std::move(pkt)]() mutable { handle_packet(std::move(packet)); });
     }
 
+    void send_batch_deleter::operator()(send_batch* b) const
+    {
+        delete b;
+    }
+
     void Endpoint::_init_internals()
     {
+        _send_batch.reset(new send_batch{});
+
         if (not _manual_routing)
         {
             log::debug(log_cat, "Starting new UDP socket on {}", _local);
@@ -1008,7 +1015,7 @@ namespace oxen::quic
         return {conn, true};
     }
 
-    io_result Endpoint::send_packets(const Path& path, std::byte* buf, size_t* bufsize, uint8_t ecn, size_t& n_pkts)
+    io_result Endpoint::send_packets(const Path& path, std::byte* buf, size_t* bufsize, uint8_t* ecn, size_t& n_pkts)
     {
         log::trace(log_cat, "{} called", __PRETTY_FUNCTION__);
 
@@ -1042,9 +1049,20 @@ namespace oxen::quic
 
         assert(n_pkts >= 1 && n_pkts <= MAX_BATCH);
 
-        log::trace(log_cat, "Sending {} UDP packet(s) {}...", n_pkts, path);
+        size_t n_try = n_pkts;
+#ifndef NDEBUG
+        if (auto& b = batch(); std::chrono::steady_clock::now() < b.debug_block_until)
+            return io_result{EAGAIN};
+        else if (b.debug_partial_sends > 0 && n_pkts > b.debug_partial_max)
+        {
+            b.debug_partial_sends--;
+            n_try = b.debug_partial_max;
+        }
+#endif
 
-        auto [ret, sent] = socket->send(path, buf, bufsize, ecn, n_pkts);
+        log::trace(log_cat, "Sending {} UDP packet(s) {}...", n_try, path);
+
+        auto [ret, sent] = socket->send(path, buf, bufsize, ecn, n_try);
 
         if (ret.failure() && !ret.blocked())
         {
@@ -1060,12 +1078,14 @@ namespace oxen::quic
 
             else
             {
-                // We sent some but not all, so shift the unsent packets back to the beginning of buf/bufsize
+                // We sent some but not all, so shift the unsent packets back to the beginning of
+                // buf/bufsize/ecn
                 log::debug(log_cat, "UDP undersent {}/{}", sent, n_pkts);
                 size_t offset = std::accumulate(bufsize, bufsize + sent, size_t{0});
                 size_t len = std::accumulate(bufsize + sent, bufsize + n_pkts, size_t{0});
                 std::memmove(buf, buf + offset, len);
                 std::copy(bufsize + sent, bufsize + n_pkts, bufsize);
+                std::copy(ecn + sent, ecn + n_pkts, ecn);
                 n_pkts -= sent;
             }
 
@@ -1077,6 +1097,122 @@ namespace oxen::quic
 
         n_pkts = 0;
         return ret;
+    }
+
+    void Endpoint::stall_send(Connection& owner)
+    {
+        auto& b = batch();
+        assert(job_queue.inside());
+        assert(!b.stalled && b.n_packets > 0);
+        b.stalled = true;
+        b.owner = &owner;
+#ifndef NDEBUG
+        b.debug_stalls++;
+#endif
+        socket->when_writeable([this] { resume_stalled_send(); });
+    }
+
+    void Endpoint::wait_for_send_stall(Connection& conn)
+    {
+        auto& b = batch();
+        assert(b.stalled);
+#ifndef NDEBUG
+        b.debug_stall_skips++;
+#endif
+        if (b.owner == &conn || conn.waiting_on_stall)
+            return;
+        conn.waiting_on_stall = true;
+        b.waiters.push_back(&conn);
+    }
+
+    void Endpoint::forget_send_stall(Connection& conn)
+    {
+        auto& b = batch();
+        if (b.owner == &conn)
+            b.owner = nullptr;
+        if (conn.waiting_on_stall)
+        {
+            std::erase(b.waiters, &conn);
+            conn.waiting_on_stall = false;
+        }
+    }
+
+    void Endpoint::resume_stalled_send()
+    {
+        auto& b = batch();
+        assert(b.stalled);
+
+        auto* owner = b.owner;
+        // A dead owner is waiting to be closed and mustn't send anything more; one that has halted
+        // (closing or draining) cleared itself from `owner` already.
+        if (owner && !owner->dead)
+        {
+            auto rv = send_packets(owner->_path, b.buf.data(), b.size.data(), b.ecn.data(), b.n_packets);
+            if (rv.blocked())
+            {
+                socket->when_writeable([this] { resume_stalled_send(); });
+                return;
+            }
+            if (rv.failure())
+            {
+                log::warning(log_cat, "Error while trying to send packet: {}", rv.str_error());
+                drop_connection(*owner, io_error{CONN_SEND_FAIL});
+            }
+        }
+        else
+        {
+            log::debug(log_cat, "Discarding {} stalled packets of a connection that has gone away", b.n_packets);
+#ifndef NDEBUG
+            b.debug_stall_discards++;
+#endif
+        }
+
+        b.n_packets = 0;
+        b.stalled = false;
+        b.owner = nullptr;
+
+        // The waiters go first, so that the owner (which already had its turn) goes to the back of
+        // the line.
+        for (auto* c : b.waiters)
+        {
+            c->waiting_on_stall = false;
+            c->packet_io_ready();
+        }
+        b.waiters.clear();
+        if (owner)
+            owner->packet_io_ready();
+    }
+
+    bool Endpoint::_debug_block_sends_for([[maybe_unused]] std::chrono::milliseconds duration)
+    {
+#ifndef NDEBUG
+        batch().debug_block_until = std::chrono::steady_clock::now() + duration;
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    bool Endpoint::_debug_partial_sends([[maybe_unused]] size_t n_sends, [[maybe_unused]] size_t max_pkts)
+    {
+#ifndef NDEBUG
+        if (max_pkts < 1)
+            throw std::invalid_argument{"max_pkts must be at least 1"};
+        batch().debug_partial_sends = n_sends;
+        batch().debug_partial_max = max_pkts;
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    Endpoint::debug_stall_stats Endpoint::_debug_stall_counts() const
+    {
+#ifndef NDEBUG
+        return {_send_batch->debug_stalls, _send_batch->debug_stall_skips, _send_batch->debug_stall_discards};
+#else
+        return {};
+#endif
     }
 
     void Endpoint::send_or_queue_packet(
@@ -1094,7 +1230,7 @@ namespace oxen::quic
 
         size_t n_pkts = 1;
         size_t bufsize = buf.size();
-        auto res = send_packets(p, buf.data(), &bufsize, ecn, n_pkts);
+        auto res = send_packets(p, buf.data(), &bufsize, &ecn, n_pkts);
 
         if (res.blocked() and not _manual_routing)
         {

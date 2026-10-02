@@ -12,7 +12,6 @@
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
 
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <concepts>
@@ -117,8 +116,9 @@ namespace oxen::quic
         /// Queues an incoming stream of the given StreamT type, forwarding the given arguments to
         /// the StreamT constructor.  The stream will be given the next unseen incoming connection
         /// ID; it will be made ready once the associated stream id is seen from the remote
-        /// connection.  Note that this constructor bypasses the stream constructor callback for the
-        /// applicable stream id.
+        /// connection.  This is an alternative to handling the stream in the stream open callback:
+        /// that callback is *not* invoked when a queued stream opens.  Note that this constructor
+        /// also bypasses the stream constructor callback for the applicable stream id.
         template <std::derived_from<Stream> StreamT, typename... Args, typename EndpointDeferred = Endpoint>
         std::shared_ptr<StreamT> queue_incoming_stream(Args&&... args)
         {
@@ -133,7 +133,8 @@ namespace oxen::quic
         /// Queues a default incoming Stream object, either via the stream constructor callback (if
         /// set) or the default Stream constructor (if no constructor callback, or the callback
         /// returns nullptr).  The stream object will be made ready once the associated next
-        /// incoming stream ID is observed from the other end.
+        /// incoming stream ID is observed from the other end.  As with the templated version, the
+        /// stream open callback is not invoked when a queued stream opens.
         std::shared_ptr<Stream> queue_incoming_stream();
 
         /// Opens a new outgoing stream to the other end of the connection of the given StreamT
@@ -454,14 +455,16 @@ namespace oxen::quic
         void on_packet_io_ready();
 
         struct pkt_tx_timer_updater;
-        bool send(pkt_tx_timer_updater* pkt_updater = nullptr);
+        bool send(pkt_tx_timer_updater& pkt_updater);
 
-        void flush_packets(std::chrono::steady_clock::time_point tp);
+        // Returns false if the endpoint's send batch is stalled on a blocked socket, in which case
+        // this connection gets woken once the stall clears and the caller should leave re-arming
+        // the retransmit timer until then.
+        [[nodiscard]] bool flush_packets(std::chrono::steady_clock::time_point tp);
 
-        std::array<std::byte, MAX_PMTUD_UDP_PAYLOAD * DATAGRAM_BATCH_SIZE> send_buffer;
-        std::array<size_t, DATAGRAM_BATCH_SIZE> send_buffer_size;
-        uint8_t send_ecn = 0;
-        size_t n_packets = 0;
+        // True while this connection is in the endpoint's list of connections waiting for a send
+        // stall to clear.
+        bool waiting_on_stall = false;
 
         void schedule_packet_retransmit(std::chrono::steady_clock::time_point ts);
 
