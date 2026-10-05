@@ -37,6 +37,14 @@ struct event_base;
 
 namespace oxen::quic
 {
+    struct send_batch;
+    // Out-of-line so that Endpoint can hold a send_batch without its definition (which depends on
+    // build-time batching support, and so must not be part of the public layout).
+    struct send_batch_deleter
+    {
+        void operator()(send_batch* b) const;
+    };
+
     class Endpoint : public std::enable_shared_from_this<Endpoint>
     {
       public:
@@ -49,9 +57,12 @@ namespace oxen::quic
         connection_established_callback connection_established_cb;
         connection_closed_callback connection_close_cb;
 
-        // Returns the max UDP payload cap configured on this endpoint, if any.  nullopt means
-        // PMTUD runs with the default maximum.
-        std::optional<size_t> get_max_udp_payload() const { return _max_udp_payload; }
+        // Returns the max UDP payload cap configured on this endpoint (the largest size in its
+        // probe list), if any.  nullopt means PMTUD runs with the default probe list.
+        std::optional<size_t> get_max_udp_payload() const
+        {
+            return _max_udp_payload ? std::make_optional(_max_udp_payload->max()) : std::nullopt;
+        }
 
         Loop& loop;
         JobQueue job_queue{loop};
@@ -97,6 +108,23 @@ namespace oxen::quic
 
         // query a list of all active inbound and outbound connections paired with a conn_interface
         std::list<std::shared_ptr<Connection>> get_all_conns(std::optional<Direction> d = std::nullopt);
+
+        // Hints that the host's network may have changed (e.g. a phone moving from Wi-Fi to
+        // cellular).  Each outbound connection that the host would now reach its peer from a
+        // different local address moves to that address, rediscovering how large a packet the new
+        // network can carry; connections whose address hasn't changed, and inbound connections, are
+        // unaffected.
+        //
+        // Calling this is optional: a connection notices the change by itself as soon as a packet
+        // from its peer arrives on the new address.  The hint helps when nothing arrives: if the new
+        // network carries smaller packets than the old one and the connection is in the middle of
+        // sending large ones, none of them gets through, so the peer has nothing to reply to until
+        // something small (e.g. a keep-alive) is sent.
+        //
+        // An application can call this from the operating system's network change notifications
+        // (e.g. Android's ConnectivityManager.NetworkCallback, or Apple's NWPathMonitor).  It may be
+        // called from any thread, and is cheap and harmless when nothing has actually changed.
+        void network_changed();
 
         const Address& local() const { return _local; }
 
@@ -180,6 +208,10 @@ namespace oxen::quic
 
         Address _local;
         std::unique_ptr<UDPSocket> socket;
+
+        // Shared by all of this endpoint's connections; see send_batch.  Declared before `conns`
+        // so that it outlives the connections, which unregister from it when they halt.
+        std::unique_ptr<send_batch, send_batch_deleter> _send_batch;
         bool _accepting_inbound{false};
         bool _datagrams{false};
         bool _packet_splitting{false};
@@ -188,8 +220,10 @@ namespace oxen::quic
         size_t _dgram_queue_limit{std::numeric_limits<size_t>::max()};
 
         opt::manual_routing _manual_routing;
-        std::optional<size_t> _max_udp_payload;
+        // nullopt means the default probe list (DEFAULT_PMTUD_PROBES).
+        std::optional<opt::max_udp_payload> _max_udp_payload;
         bool _allow_gso{false};
+        bool _allow_gro{false};
 
         uint64_t _next_rid{0};
 
@@ -222,6 +256,7 @@ namespace oxen::quic
         void handle_ep_opt(opt::manual_routing mrouting);
         void handle_ep_opt(opt::max_udp_payload mup);
         void handle_ep_opt(opt::allow_gso);
+        void handle_ep_opt(opt::allow_gro);
 
         // Takes a std::optional-wrapped option that does nothing if the optional is empty,
         // otherwise passes it through to the above.  This is here to allow runtime-dependent
@@ -243,15 +278,91 @@ namespace oxen::quic
         /// with `.blocked()` set to true.  buf/bufsize/n_pkts are not altered (since they have not
         /// been sent).
         ///
-        /// If some, but not all, packets were sent then `buf`, `bufsize`, and `n_pkts` will be
+        /// `ecn` gives the ECN value of each packet.  `pin_source` is passed on to UDPSocket::send:
+        /// true sends from `path.local`, which replies to a peer must do.
+        ///
+        /// If some, but not all, packets were sent then `buf`, `bufsize`, `ecn`, and `n_pkts` will be
         /// updated so that the *unsent* `n_pkts` packets begin at buf, with sizes given in
-        /// `bufsize` -- so that the same `buf`/`bufsize`/`n_pkts` can be passed in when ready to
-        /// retry sending.
+        /// `bufsize` and ECN values in `ecn` -- so that the same `buf`/`bufsize`/`ecn`/`n_pkts` can
+        /// be passed in when ready to retry sending.
+        ///
+        /// Packets the socket refuses as too big for the path (EMSGSIZE) are dropped, along with any
+        /// others at least as large, and the rest are still sent; if `too_big` is given (pointing at
+        /// 0), it is set to the size of the smallest packet dropped that way, if any.
+        /// If the socket has no buffer space (ENOBUFS), the remaining packets are dropped.  Either
+        /// way the send still counts as a success: QUIC treats the dropped packets as lost.
         ///
         /// If a more serious error occurs (other than a blocked socket) then `n_pkts` is set to 0
         /// (effectively dropping all packets) and a result is returned with `.failure()` true (and
         /// `.blocked()` false).
-        io_result send_packets(const Path& path, std::byte* buf, size_t* bufsize, uint8_t ecn, size_t& n_pkts);
+        io_result send_packets(
+                const Path& path,
+                std::byte* buf,
+                size_t* bufsize,
+                uint8_t* ecn,
+                size_t& n_pkts,
+                bool pin_source,
+                size_t* too_big = nullptr);
+
+        // The local address our socket would currently use to reach `remote` (see
+        // UDPSocket::local_address_for), or nullopt if that can't be determined.
+        std::optional<Address> local_address_for(const Address& remote) const;
+
+        send_batch& batch() { return *_send_batch; }
+
+        // Called when `owner`'s send of the batch blocked: leaves the unsent packets in the batch
+        // and waits for the socket to become writable again before letting anyone send.
+        void stall_send(Connection& owner);
+
+        // Called when a connection wants to flush during a stall, so that it gets woken once the
+        // stall clears.
+        void wait_for_send_stall(Connection& conn);
+
+        // Called when a connection halts: it can't be the owner of, or wait on, a stall any more.
+        void forget_send_stall(Connection& conn);
+
+        // Finishes sending a stalled batch once the socket is writable, then wakes the waiters.
+        void resume_stalled_send();
+
+        // Test hooks, only functional in debug builds of libquic (the state they use doesn't exist
+        // otherwise): makes socket sends report blocked for the given duration, returning false if
+        // unsupported; and returns send statistics so far (all zero if unsupported).
+        bool _debug_block_sends_for(std::chrono::milliseconds duration);
+        // Makes the next `n_sends` socket sends of more than `max_pkts` (>= 1) packets send only
+        // that many, reporting the rest unsent, and (if `then_block`) the immediate retry of the
+        // rest report EAGAIN; returns false if unsupported (a release build, or one that sends one
+        // packet at a time).
+        bool _debug_partial_sends(size_t n_sends, size_t max_pkts, bool then_block);
+        // Makes packets larger than `mtu` (0 to turn this off) fail to send with EMSGSIZE, as on a
+        // path with that MTU; returns false if unsupported.
+        bool _debug_mtu(size_t mtu);
+        // Makes the next `n_sends` socket sends fail with `err`; returns false if unsupported.
+        bool _debug_fail_sends(int err, size_t n_sends);
+        // Makes looking up the local address used to reach a peer return `addr` (nullopt to stop),
+        // as though the host's routing had changed; returns false if unsupported.
+        bool _debug_simulate_route_source(std::optional<Address> addr);
+        // Makes received packets report `addr` (nullopt to stop) as the local address they arrived
+        // on; returns false if unsupported.
+        bool _debug_simulate_arrival_address(std::optional<Address> addr);
+        // Makes packets sent without a pinned source (i.e. those of outbound connections) actually
+        // go out from `addr` (nullopt to stop), as they would once the kernel's routing changed;
+        // returns false if unsupported.
+        bool _debug_simulate_send_source(std::optional<Address> addr);
+        // Returns how many times the local address used to reach a peer has been looked up (0 if
+        // unsupported).
+        size_t _debug_route_lookups() const;
+        // Makes the next `n` connection migrations fail as though there were no spare connection
+        // ID; returns false if unsupported.
+        bool _debug_block_migrations(size_t n);
+        struct debug_send_stats
+        {
+            size_t stalls = 0;           // Times the send batch stalled on a blocked socket
+            size_t skips = 0;            // Flushes skipped because of a stall
+            size_t discards = 0;         // Stalled batches discarded because their owner went away
+            size_t too_big_drops = 0;    // Packets dropped as too big for their path (EMSGSIZE)
+            size_t no_buffer_drops = 0;  // Packets dropped for lack of local buffer space (ENOBUFS)
+        };
+        debug_send_stats _debug_send_stats() const;
 
         // Drops a connection from the endpoint.  This is dangerous to call from *within* methods on
         // a connection itself, and generally should be deferred via a call_soon.
@@ -348,6 +459,13 @@ namespace oxen::quic
 
         std::unordered_map<quic_cid, ConnectionID> conn_lookup;
 
+        // The connection fetch_associated_conn last found, and the connection ID it was found by:
+        // consecutive packets nearly always belong to the same connection, so this saves looking it
+        // up in both maps for each.  Has to be forgotten whenever an entry leaves either map.
+        quic_cid _last_lookup_cid;
+        Connection* _last_lookup_conn = nullptr;
+        void forget_last_lookup() { _last_lookup_conn = nullptr; }
+
         std::unordered_map<hashed_reset_token, ConnectionID> reset_token_conns;
 
         std::map<std::chrono::steady_clock::time_point, ConnectionID> draining_closing;
@@ -360,9 +478,13 @@ namespace oxen::quic
         //
         // The callback will be called with the final io_result once the packet is sent (or once it
         // fails).  It can be called immediately, if the packet sends right away, but can be delayed
-        // if the socket would block.
+        // if the socket would block.  `pin_source` is as for send_packets.
         void send_or_queue_packet(
-                const Path& p, std::vector<std::byte> buf, uint8_t ecn, std::function<void(io_result)> callback = nullptr);
+                const Path& p,
+                std::vector<std::byte> buf,
+                uint8_t ecn,
+                bool pin_source,
+                std::function<void(io_result)> callback = nullptr);
 
         void send_stateless_reset(const Packet& pkt, const quic_cid& cid);
 

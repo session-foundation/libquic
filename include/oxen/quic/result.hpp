@@ -64,6 +64,9 @@ namespace oxen::quic
     inline constexpr uint64_t CONN_EARLY_DATA_REJECTED = ERROR_BASE + 1004;
     // Stateless reset received
     inline constexpr uint64_t CONN_STATELESS_RESET = ERROR_BASE + 1005;
+    // The path can no longer carry packets of the size established for it; reconnecting
+    // rediscovers the path's size.
+    inline constexpr uint64_t CONN_MTU_EXCEEDED = ERROR_BASE + 1006;
 
     std::string quic_strerror(uint64_t e);
 
@@ -119,6 +122,26 @@ namespace oxen::quic
                  : is_wsa ? error_code == WSAEWOULDBLOCK
 #endif
                           : (error_code == EAGAIN || error_code == EWOULDBLOCK);
+        }
+        // returns true if error value indicates a datagram too large to send on its path (e.g. a
+        // PMTUD probe larger than the path MTU)
+        bool too_big() const
+        {
+            return is_ngtcp2 ? false
+#ifdef _WIN32
+                 : is_wsa ? error_code == WSAEMSGSIZE
+#endif
+                          : error_code == EMSGSIZE;
+        }
+        // returns true if error value indicates that a local queue (such as an interface's
+        // transmit queue) had no room for the datagram
+        bool no_buffers() const
+        {
+            return is_ngtcp2 ? false
+#ifdef _WIN32
+                 : is_wsa ? error_code == WSAENOBUFS
+#endif
+                          : error_code == ENOBUFS;
         }
 
         // returns the error message string describing error_code

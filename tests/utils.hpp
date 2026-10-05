@@ -96,6 +96,76 @@ namespace oxen::quic
 
         static UDPSocket::socket_t get_sock(Endpoint& ep);
 
+        // Makes the endpoint's socket sends report blocked for the given duration.  Returns false
+        // (and does nothing) if libquic wasn't built in debug mode, which this requires.
+        static bool block_sends_for(Endpoint& ep, std::chrono::milliseconds duration);
+        // Makes the endpoint's next `n_sends` socket sends of more than `max_pkts` packets send only
+        // that many, with the immediate retry of the rest reporting EAGAIN if `then_block` (as a
+        // nearly-full socket would).  Returns false (and does nothing) if libquic wasn't built in
+        // debug mode.
+        static bool partial_sends(Endpoint& ep, size_t n_sends, size_t max_pkts, bool then_block = true);
+        // Makes the endpoint's packets larger than `mtu` (0 to turn off) fail with EMSGSIZE, as on
+        // a path with that MTU.  Returns false (and does nothing) if not a debug build.
+        static bool simulate_mtu(Endpoint& ep, size_t mtu);
+        // Makes the endpoint's next `n_sends` socket sends fail with `err`.  Returns false (and does
+        // nothing) if not a debug build.
+        static bool fail_sends(Endpoint& ep, int err, size_t n_sends);
+        // Simulates the host's address changing to `addr` (nullopt to stop), as seen by the
+        // endpoint: the route to a peer uses it, and packets arrive on it.  Returns false (and does
+        // nothing) if not a debug build.
+        static bool simulate_local_address(Endpoint& ep, std::optional<Address> addr);
+        // Simulates packets arriving on `addr` (nullopt to stop) without the route to a peer
+        // changing, as with asymmetric routing.  Returns false (and does nothing) if not a debug
+        // build.
+        static bool simulate_arrival_address(Endpoint& ep, std::optional<Address> addr);
+        // Switches the host's source address to `addr` (nullopt to stop): unlike
+        // simulate_local_address, the endpoint's outbound packets really go out from it, so the
+        // peer sees them come from there and replies really arrive on it.  `addr` has to be one the
+        // host can send from (e.g. any of 127/8 on Linux).  Returns false (and does nothing) if not
+        // a debug build.
+        static bool switch_source_address(Endpoint& ep, std::optional<Address> addr);
+        // Returns the remote address of ngtcp2's current path for the connection.
+        static Address ngtcp2_path_remote(Connection& conn);
+        // Returns how many times the endpoint has looked up the local address used to reach a peer
+        // (always 0 if not a debug build).
+        static size_t route_lookups(Endpoint& ep);
+        // Makes the endpoint's next `n` connection migrations fail as though there were no spare
+        // connection ID.  Returns false (and does nothing) if not a debug build.
+        static bool block_migrations(Endpoint& ep, size_t n);
+        // Returns the local address of ngtcp2's current path for the connection.
+        static Address ngtcp2_path_local(Connection& conn);
+
+        // Makes the endpoint socket's upcoming sends fail, in order, with `gso_errors` (sends using
+        // GSO) and `plain_errors` (sends without it).  Returns false (and does nothing) if not a
+        // debug build.
+        static bool fail_socket_sends(Endpoint& ep, std::vector<int> gso_errors, std::vector<int> plain_errors);
+        // Returns whether the endpoint's socket is currently sending with GSO.
+        static bool gso_enabled(Endpoint& ep);
+        // Returns whether the endpoint's socket is receiving with GRO.
+        static bool gro_enabled(Endpoint& ep);
+        // Returns how many buffers holding several GRO-merged packets the endpoint's socket has
+        // received, or nullopt if not a debug build.
+        static std::optional<size_t> gro_merges(Endpoint& ep);
+        // As above, for a socket used directly; these must be called on its loop's thread.
+        static bool gso_enabled(const UDPSocket& sock) { return sock.gso_; }
+        static bool gro_enabled(const UDPSocket& sock) { return sock.gro_; }
+        static std::optional<size_t> gro_merges(const UDPSocket& sock) { return sock._debug_gro_merges(); }
+
+        // Returns the largest UDP payload ngtcp2 currently sends on the connection's path (i.e.
+        // the size PMTUD has validated so far).
+        static size_t path_max_udp_payload(Connection& conn);
+
+        // Calls the endpoint's internal send_packets (on its loop thread).
+        static io_result send_packets(
+                Endpoint& ep, const Path& path, std::byte* buf, size_t* bufsize, uint8_t* ecn, size_t& n_pkts);
+
+        // Returns the endpoint's send statistics so far (all zero in non-debug builds).
+        static Endpoint::debug_send_stats send_stats(Endpoint& ep);
+
+        // Marks the connection dead, as a fatal ngtcp2 error does, but without also scheduling its
+        // close (so that the test controls what happens in between).
+        static void mark_dead(Connection& conn);
+
         static void drop_connection(Endpoint& ep, Connection& conn, io_error err);
 
         // Blocks until every job already queued on the endpoint's job queue has run.  Jobs that
@@ -116,8 +186,6 @@ namespace oxen::quic
 
     void sha3_256(uint8_t* out, std::span<const uint8_t> value, std::string_view domain = "");
     void sha3_256(uint8_t* out, std::span<const char> value, std::string_view domain = "");
-    void sha3_512(uint8_t* out, std::span<const uint8_t> value, std::string_view domain = "");
-    void sha3_512(uint8_t* out, std::span<const char> value, std::string_view domain = "");
 
     // Generates an Ed25519 keypair for testing purposes.  Returned values are the 32-byte seed and
     // 32-byte pubkey.  If you provide a seed_string, then that string is hashed to produce the
