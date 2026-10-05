@@ -102,12 +102,17 @@ namespace oxen::quic
 
     void Endpoint::handle_ep_opt(opt::max_udp_payload mup)
     {
-        _max_udp_payload = mup.size;
+        _max_udp_payload = std::move(mup);
     }
 
     void Endpoint::handle_ep_opt([[maybe_unused]] opt::allow_gso)
     {
         _allow_gso = true;
+    }
+
+    void Endpoint::handle_ep_opt([[maybe_unused]] opt::allow_gro)
+    {
+        _allow_gro = true;
     }
 
     ConnectionID Endpoint::next_reference_id()
@@ -127,6 +132,11 @@ namespace oxen::quic
 
     void Endpoint::manually_receive_packet(Packet&& pkt)
     {
+        // The application decides when (and in what order) it hands packets over, so a time it was
+        // received at could be older than one its connection has already been given; it is timed
+        // as it's handled instead.
+        pkt.received.reset();
+
         if (job_queue.inside())
             return handle_packet(std::move(pkt));
 
@@ -134,14 +144,23 @@ namespace oxen::quic
         job_queue.call_soon([this, packet = std::move(pkt)]() mutable { handle_packet(std::move(packet)); });
     }
 
+    void send_batch_deleter::operator()(send_batch* b) const
+    {
+        delete b;
+    }
+
     void Endpoint::_init_internals()
     {
+        _send_batch.reset(new send_batch{});
+
         if (not _manual_routing)
         {
             log::debug(log_cat, "Starting new UDP socket on {}", _local);
-            socket = std::make_unique<UDPSocket>(loop.get_event_base(), _local, _allow_gso, [this](Packet&& packet) {
-                handle_packet(std::move(packet));
-            });
+            socket = std::make_unique<UDPSocket>(
+                    loop.get_event_base(),
+                    _local,
+                    UDPSocket::options{.allow_gso = _allow_gso, .allow_gro = _allow_gro},
+                    [this](Packet&& packet) { handle_packet(std::move(packet)); });
 
             _local = socket->address();
         }
@@ -159,7 +178,12 @@ namespace oxen::quic
 
     std::shared_ptr<Connection> Endpoint::_connect(RemoteAddress remote, std::shared_ptr<IOContext> ctx)
     {
-        Path path = Path{_local, std::move(remote)};
+        // Labelling the path with the source address the host's routing actually uses (rather than
+        // an any-address bind) means a change of that address is a change of path.
+        Address local = _local;
+        if (auto source = local_address_for(remote))
+            local = *source;
+        Path path{local, std::move(remote)};
 
         auto rid = next_reference_id();
 
@@ -182,17 +206,15 @@ namespace oxen::quic
                             ctx,
                             alpns,
                             ctx->config.handshake_timeout.value_or(handshake_timeout),
-                            remote.get_remote_key(),
-                            nullptr,
-                            std::nullopt,
-                            nullptr,
-                            _max_udp_payload);
+                            get_time(),
+                            remote.get_remote_key());
                     return it_b->second;
                 }
                 catch (...)
                 {
                     conns.erase(it_b);
                     conn_lookup.erase(it_a);
+                    forget_last_lookup();
                     throw;
                 }
             }
@@ -205,6 +227,20 @@ namespace oxen::quic
         ctx.config.dgram_queue_limit = _dgram_queue_limit;
         ctx.config.split_packet = _packet_splitting;
         ctx.config.policy = _policy;
+    }
+
+    void Endpoint::network_changed()
+    {
+        job_queue.call([this] {
+            for (const auto& [rid, conn] : conns)
+            {
+                if (!conn->is_outbound())
+                    continue;
+                // An arrival address checked on the old network says nothing about the new one.
+                conn->_unconfirmed_local.reset();
+                conn->check_local_address();
+            }
+        });
     }
 
     std::list<std::shared_ptr<Connection>> Endpoint::get_all_conns(std::optional<Direction> d)
@@ -299,6 +335,9 @@ namespace oxen::quic
 
     void Endpoint::handle_packet(Packet&& pkt)
     {
+        if (!pkt.received)
+            pkt.received = get_time();
+
         auto dcid_opt = handle_packet_connid(pkt);
 
         if (!dcid_opt)
@@ -340,17 +379,28 @@ namespace oxen::quic
         }
 
         if (cptr->is_outbound())
-            // For a inbound packet on an outbound connection the packet handling code will have set
-            // the actual ip address in the packet, but that might not match the path that we
-            // created the connection with (because, often, we create using the any address), so
-            // forcibly reset the local address to the endpoint bind address so that we don't see it
-            // on an unknown path because of the anyaddr != specific address mismatch.
+        {
+#ifndef NDEBUG
+            if (const auto& simulated = batch().debug_arrival_address)
+                pkt.path.local = *simulated;
+#endif
+            // An outbound connection's local address is our label for the network it's on.  A
+            // packet arriving on a different local address is a sign that the host's network has
+            // changed, but it can also just be asymmetric routing on a multi-homed host, so the
+            // connection checks the source address it would now send from before migrating.  (The
+            // any-address means the OS didn't report the address at all.)
+            if (!pkt.path.local.is_any_addr() && pkt.path.local != cptr->_path.local)
+                cptr->local_address_mismatch(pkt.path.local, ngtcp2_ts(*pkt.received));
+
+            // Either way, ngtcp2 clients drop packets from a path they don't know, so the packet gets
+            // the connection's own local address.
             //
             // We *don't* want to do this for inbound connections because we absolutely have to
             // return those from the same address they arrived on (otherwise, on a multi-IP machine,
             // you could have something arrive on IP2 but reply on IP1, which the remote side will
             // not accept).
-            pkt.path.local = _local;
+            pkt.path.local = cptr->_path.local;
+        }
 
         cptr->handle_conn_packet(std::move(pkt));
     }
@@ -499,15 +549,24 @@ namespace oxen::quic
         // A blocked send parks this callback on the socket until it becomes writeable, but the
         // cleanup scheduled just above is on a timer that does not wait for that: it can fire, and
         // destroy the connection, first.  Hence the id-and-lookup rather than capturing `conn`.
-        send_or_queue_packet(conn.path(), std::move(buf), /*ecn=*/0, [this, rid = conn.reference_id()](io_result rv) {
-            if (not rv.failure())
-                return;
+        send_or_queue_packet(
+                conn.path(),
+                std::move(buf),
+                /*ecn=*/0,
+                !conn.is_outbound(),
+                [this, rid = conn.reference_id()](io_result rv) {
+                    if (not rv.failure())
+                        return;
 
-            log::warning(log_cat, "Error: failed to send close packet [{}]; removing connection ({})", rv.str_error(), rid);
+                    log::warning(
+                            log_cat,
+                            "Error: failed to send close packet [{}]; removing connection ({})",
+                            rv.str_error(),
+                            rid);
 
-            if (auto c = get_conn(rid))
-                delete_connection(*c);
-        });
+                    if (auto c = get_conn(rid))
+                        delete_connection(*c);
+                });
     }
 
     void Endpoint::delete_connection(Connection& conn)
@@ -541,6 +600,7 @@ namespace oxen::quic
             // for `rid` being still in the endpoint and so, in that respect, we want the connection
             // to be considered gone even if its destructor doesn't fire yet.
             conns.erase(it);
+            forget_last_lookup();
             log::debug(log_cat, "Deleted connection ({})", rid);
         }
     }
@@ -641,6 +701,7 @@ namespace oxen::quic
                 log_cat, "{} dissociating CID:{} to {}", conn.is_inbound() ? "SERVER" : "CLIENT", qcid, conn.reference_id());
 
         conn_lookup.erase(qcid);
+        forget_last_lookup();
         conn.delete_associated_cid(qcid);
     }
 
@@ -653,11 +714,16 @@ namespace oxen::quic
 
     Connection* Endpoint::fetch_associated_conn(const quic_cid& ccid)
     {
+        if (_last_lookup_conn && ccid == _last_lookup_cid)
+            return _last_lookup_conn;
+
         if (auto it_a = conn_lookup.find(ccid); it_a != conn_lookup.end())
         {
-            if (auto it_b = conns.find(it_a->second); it_b != conns.end())
+            if (auto it_b = conns.find(it_a->second); it_b != conns.end() && it_b->second)
             {
-                return it_b->second.get();
+                _last_lookup_cid = ccid;
+                _last_lookup_conn = it_b->second.get();
+                return _last_lookup_conn;
             }
         }
 
@@ -762,7 +828,7 @@ namespace oxen::quic
         assert(static_cast<size_t>(nwrite) <= buf.size());
         buf.resize(nwrite);
 
-        send_or_queue_packet(pkt.path, std::move(buf), /* ecn */ 0);
+        send_or_queue_packet(pkt.path, std::move(buf), /* ecn */ 0, /* pin_source */ true);
     }
 
     void Endpoint::send_retry(const Packet& pkt, ngtcp2_pkt_hd* hdr)
@@ -812,7 +878,7 @@ namespace oxen::quic
         assert(static_cast<size_t>(nwrite) <= buf.size());
         buf.resize(nwrite);
 
-        send_or_queue_packet(pkt.path, std::move(buf), /* ecn */ 0);
+        send_or_queue_packet(pkt.path, std::move(buf), /* ecn */ 0, /* pin_source */ true);
     }
 
     void Endpoint::send_stateless_connection_close(const Packet& pkt, ngtcp2_pkt_hd* hdr, io_error ec)
@@ -832,7 +898,7 @@ namespace oxen::quic
         assert(static_cast<size_t>(nwrite) <= buf.size());
         buf.resize(nwrite);
 
-        send_or_queue_packet(pkt.path, std::move(buf), /* ecn */ 0);
+        send_or_queue_packet(pkt.path, std::move(buf), /* ecn */ 0, /* pin_source */ true);
     }
 
     void Endpoint::store_path_validation_token(Address remote, std::vector<unsigned char> token)
@@ -992,11 +1058,11 @@ namespace oxen::quic
                             inbound_ctx,
                             inbound_alpns,
                             handshake_timeout,
+                            pkt.received.value(),
                             std::nullopt,
                             &hdr,
                             token_type,
-                            pkt_original_cid,
-                            _max_udp_payload);
+                            pkt_original_cid);
 
                     conn = it_b->second.get();
                     break;
@@ -1008,7 +1074,51 @@ namespace oxen::quic
         return {conn, true};
     }
 
-    io_result Endpoint::send_packets(const Path& path, std::byte* buf, size_t* bufsize, uint8_t ecn, size_t& n_pkts)
+    // Removes every packet of at least `min_size` bytes from the batch, keeping the rest in order,
+    // and returns how many were removed.
+    static size_t drop_packets_from(std::byte* buf, size_t* bufsize, uint8_t* ecn, size_t& n_pkts, size_t min_size)
+    {
+        size_t kept = 0;
+        const std::byte* in = buf;
+        std::byte* out = buf;
+        for (size_t i = 0; i < n_pkts; i++)
+        {
+            const size_t sz = bufsize[i];
+            if (sz < min_size)
+            {
+                if (out != in)
+                    std::memmove(out, in, sz);
+                bufsize[kept] = sz;
+                ecn[kept] = ecn[i];
+                kept++;
+                out += sz;
+            }
+            in += sz;
+        }
+        size_t dropped = n_pkts - kept;
+        n_pkts = kept;
+        return dropped;
+    }
+
+    // Counts `n` dropped packets in `counter`, logging the first and then one in every 100.
+    static void count_drops(size_t& counter, size_t n, std::string_view why, const Path& path)
+    {
+        size_t before = counter;
+        counter += n;
+        if (before == 0 || before / 100 != counter / 100)
+            log::debug(log_cat, "Dropped {} packet(s) {}: {} ({} so far)", n, path, why, counter);
+        else
+            log::trace(log_cat, "Dropped {} packet(s) {}: {} ({} so far)", n, path, why, counter);
+    }
+
+    io_result Endpoint::send_packets(
+            const Path& path,
+            std::byte* buf,
+            size_t* bufsize,
+            uint8_t* ecn,
+            size_t& n_pkts,
+            bool pin_source,
+            size_t* too_big)
     {
         log::trace(log_cat, "{} called", __PRETTY_FUNCTION__);
 
@@ -1042,45 +1152,336 @@ namespace oxen::quic
 
         assert(n_pkts >= 1 && n_pkts <= MAX_BATCH);
 
-        log::trace(log_cat, "Sending {} UDP packet(s) {}...", n_pkts, path);
-
-        auto [ret, sent] = socket->send(path, buf, bufsize, ecn, n_pkts);
-
-        if (ret.failure() && !ret.blocked())
+        // sendmmsg only reports an error when its *first* message fails: when a later one fails it
+        // returns the short count and the error is lost.  So a short count without an error gets
+        // one immediate retry of the rest, to find out why, rather than being assumed to mean that
+        // the socket is full.
+        bool retried = false;
+        for (;;)
         {
-            log::error(log_cat, "Error sending packets {}: {}", path, ret.str_error());
-            n_pkts = 0;  // Drop any packets, as we had a serious error
-            return ret;
-        }
-
-        if (sent < n_pkts)
-        {
-            if (sent == 0)  // Didn't send *any* packets, i.e. we got entirely blocked
-                log::debug(log_cat, "UDP sent none of {}", n_pkts);
-
-            else
+            size_t n_try = n_pkts;
+            std::pair<io_result, size_t> result;
+#ifndef NDEBUG
+            auto& b = batch();
+            std::optional<io_result> debug_result;
+            if (std::chrono::steady_clock::now() < b.debug_block_until)
+                return io_result{EAGAIN};
+            else if (b.debug_partial_block_next)
             {
-                // We sent some but not all, so shift the unsent packets back to the beginning of buf/bufsize
+                b.debug_partial_block_next = false;
+                return io_result{EAGAIN};
+            }
+            else if (b.debug_fail_count > 0)
+            {
+                b.debug_fail_count--;
+                debug_result.emplace(b.debug_fail_errno);
+            }
+            else if (b.debug_partial_sends > 0 && n_pkts > b.debug_partial_max)
+            {
+                b.debug_partial_sends--;
+                n_try = b.debug_partial_max;
+                b.debug_partial_block_next = b.debug_partial_then_block;
+            }
+            if (!debug_result && b.debug_mtu)
+            {
+                // As sendmmsg would: an error if the first packet is too big, otherwise the packets
+                // before the first too-big one go out and the error is lost.
+                auto too_big = std::find_if(bufsize, bufsize + n_try, [&](size_t s) { return s > b.debug_mtu; });
+                if (too_big == bufsize)
+                    debug_result.emplace(EMSGSIZE);
+                else
+                    n_try = too_big - bufsize;
+            }
+            if (debug_result)
+                result = {*debug_result, 0};
+            else if (b.debug_send_source && !pin_source)
+                result = socket->send(Path{*b.debug_send_source, path.remote}, buf, bufsize, ecn, n_try, true);
+            else
+#endif
+            {
+                log::trace(log_cat, "Sending {} UDP packet(s) {}...", n_try, path);
+                result = socket->send(path, buf, bufsize, ecn, n_try, pin_source);
+            }
+            auto& [ret, sent] = result;
+
+            if (sent > 0 && sent < n_pkts)
+            {
+                // Shift the unsent packets back to the beginning of buf/bufsize/ecn
                 log::debug(log_cat, "UDP undersent {}/{}", sent, n_pkts);
                 size_t offset = std::accumulate(bufsize, bufsize + sent, size_t{0});
                 size_t len = std::accumulate(bufsize + sent, bufsize + n_pkts, size_t{0});
                 std::memmove(buf, buf + offset, len);
                 std::copy(bufsize + sent, bufsize + n_pkts, bufsize);
-                n_pkts -= sent;
+                std::copy(ecn + sent, ecn + n_pkts, ecn);
+            }
+            n_pkts -= sent;
+
+            if (n_pkts == 0)
+                return io_result{};
+
+            if (ret.blocked())
+            {
+                log::debug(log_cat, "UDP send blocked with {} packet(s) unsent", n_pkts);
+                return ret;
             }
 
-            // We always return EAGAIN (so that .blocked() is true) if we failed to send all, even
-            // if that isn't strictly what we got back as the return value (sendmmsg gives back a
-            // non-error on *partial* success).
-            return io_result{EAGAIN};
+            if (ret.too_big())
+            {
+                // The first unsent packet is too big for the path (e.g. a PMTUD probe), and so is
+                // any other at least as large, since they all have the same destination: drop them
+                // (QUIC treats them as lost) and carry on with the rest.
+                const size_t size = bufsize[0];
+                if (too_big)
+                    *too_big = *too_big ? std::min(*too_big, size) : size;
+                count_drops(
+                        batch().too_big_drops,
+                        drop_packets_from(buf, bufsize, ecn, n_pkts, size),
+                        "too big for the path",
+                        path);
+                if (n_pkts == 0)
+                    return io_result{};
+                retried = false;
+                continue;
+            }
+
+            if (ret.no_buffers())
+            {
+                // A local queue is full, so the rest would most likely fail too: drop them, and let
+                // QUIC's loss recovery and congestion control deal with it like any other loss.
+                count_drops(batch().no_buffer_drops, n_pkts, "no local buffer space", path);
+                n_pkts = 0;
+                return io_result{};
+            }
+
+            if (ret.failure())
+            {
+                log::error(log_cat, "Error sending packets {}: {}", path, ret.str_error());
+                n_pkts = 0;  // Drop any packets, as we had a serious error
+                return ret;
+            }
+
+            if (retried)
+            {
+                // Short again without an error, so treat it as the socket being full.
+                log::debug(log_cat, "UDP send undersent again; treating {} unsent packet(s) as blocked", n_pkts);
+                return io_result{EAGAIN};
+            }
+            retried = true;
+        }
+    }
+
+    void Endpoint::stall_send(Connection& owner)
+    {
+        auto& b = batch();
+        assert(job_queue.inside());
+        assert(!b.stalled && b.n_packets > 0);
+        b.stalled = true;
+        b.owner = &owner;
+#ifndef NDEBUG
+        b.debug_stalls++;
+#endif
+        socket->when_writeable([this] { resume_stalled_send(); });
+    }
+
+    void Endpoint::wait_for_send_stall(Connection& conn)
+    {
+        auto& b = batch();
+        assert(b.stalled);
+#ifndef NDEBUG
+        b.debug_stall_skips++;
+#endif
+        if (b.owner == &conn || conn.waiting_on_stall)
+            return;
+        conn.waiting_on_stall = true;
+        b.waiters.push_back(&conn);
+    }
+
+    void Endpoint::forget_send_stall(Connection& conn)
+    {
+        auto& b = batch();
+        if (b.owner == &conn)
+            b.owner = nullptr;
+        if (conn.waiting_on_stall)
+        {
+            std::erase(b.waiters, &conn);
+            conn.waiting_on_stall = false;
+        }
+    }
+
+    void Endpoint::resume_stalled_send()
+    {
+        auto& b = batch();
+        assert(b.stalled);
+
+        auto* owner = b.owner;
+        // A dead owner is waiting to be closed and mustn't send anything more; one that has halted
+        // (closing or draining) cleared itself from `owner` already.
+        if (owner && !owner->dead)
+        {
+            size_t too_big = 0;
+            auto rv = send_packets(
+                    owner->_path, b.buf.data(), b.size.data(), b.ecn.data(), b.n_packets, !owner->is_outbound(), &too_big);
+            if (too_big)
+                owner->packet_too_big(too_big, get_timestamp().count());
+            if (rv.blocked())
+            {
+                socket->when_writeable([this] { resume_stalled_send(); });
+                return;
+            }
+            if (rv.failure())
+            {
+                log::warning(log_cat, "Error while trying to send packet: {}", rv.str_error());
+                drop_connection(*owner, io_error{CONN_SEND_FAIL});
+            }
+        }
+        else
+        {
+            log::debug(log_cat, "Discarding {} stalled packets of a connection that has gone away", b.n_packets);
+#ifndef NDEBUG
+            b.debug_stall_discards++;
+#endif
         }
 
-        n_pkts = 0;
-        return ret;
+        b.n_packets = 0;
+        b.stalled = false;
+        b.owner = nullptr;
+
+        // The waiters go first, so that the owner (which already had its turn) goes to the back of
+        // the line.
+        for (auto* c : b.waiters)
+        {
+            c->waiting_on_stall = false;
+            c->packet_io_ready();
+        }
+        b.waiters.clear();
+        if (owner)
+            owner->packet_io_ready();
+    }
+
+    bool Endpoint::_debug_block_sends_for([[maybe_unused]] std::chrono::milliseconds duration)
+    {
+#ifndef NDEBUG
+        batch().debug_block_until = std::chrono::steady_clock::now() + duration;
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    bool Endpoint::_debug_partial_sends(
+            [[maybe_unused]] size_t n_sends, [[maybe_unused]] size_t max_pkts, [[maybe_unused]] bool then_block)
+    {
+#ifndef NDEBUG
+        if (max_pkts < 1)
+            throw std::invalid_argument{"max_pkts must be at least 1"};
+        // Without batched sends every send is a single packet, which can't be partly sent.
+        if (MAX_BATCH < 2)
+            return false;
+        auto& b = batch();
+        b.debug_partial_sends = n_sends;
+        b.debug_partial_max = max_pkts;
+        b.debug_partial_then_block = then_block;
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    std::optional<Address> Endpoint::local_address_for(const Address& remote) const
+    {
+#ifndef NDEBUG
+        _send_batch->debug_route_lookups++;
+        if (const auto& simulated = _send_batch->debug_route_source)
+            return simulated;
+#endif
+        if (!socket)
+            return std::nullopt;
+        return socket->local_address_for(remote);
+    }
+
+    bool Endpoint::_debug_simulate_route_source([[maybe_unused]] std::optional<Address> addr)
+    {
+#ifndef NDEBUG
+        batch().debug_route_source = std::move(addr);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    bool Endpoint::_debug_simulate_arrival_address([[maybe_unused]] std::optional<Address> addr)
+    {
+#ifndef NDEBUG
+        batch().debug_arrival_address = std::move(addr);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    bool Endpoint::_debug_simulate_send_source([[maybe_unused]] std::optional<Address> addr)
+    {
+#ifndef NDEBUG
+        batch().debug_send_source = std::move(addr);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    size_t Endpoint::_debug_route_lookups() const
+    {
+#ifndef NDEBUG
+        return _send_batch->debug_route_lookups;
+#else
+        return 0;
+#endif
+    }
+
+    bool Endpoint::_debug_block_migrations([[maybe_unused]] size_t n)
+    {
+#ifndef NDEBUG
+        batch().debug_blocked_migrations = n;
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    bool Endpoint::_debug_mtu([[maybe_unused]] size_t mtu)
+    {
+#ifndef NDEBUG
+        batch().debug_mtu = mtu;
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    bool Endpoint::_debug_fail_sends([[maybe_unused]] int err, [[maybe_unused]] size_t n_sends)
+    {
+#ifndef NDEBUG
+        auto& b = batch();
+        b.debug_fail_errno = err;
+        b.debug_fail_count = n_sends;
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    Endpoint::debug_send_stats Endpoint::_debug_send_stats() const
+    {
+#ifndef NDEBUG
+        auto& b = *_send_batch;
+        return {b.debug_stalls, b.debug_stall_skips, b.debug_stall_discards, b.too_big_drops, b.no_buffer_drops};
+#else
+        return {};
+#endif
     }
 
     void Endpoint::send_or_queue_packet(
-            const Path& p, std::vector<std::byte> buf, uint8_t ecn, std::function<void(io_result)> callback)
+            const Path& p, std::vector<std::byte> buf, uint8_t ecn, bool pin_source, std::function<void(io_result)> callback)
     {
         log::trace(log_cat, "{} called", __PRETTY_FUNCTION__);
 
@@ -1094,12 +1495,12 @@ namespace oxen::quic
 
         size_t n_pkts = 1;
         size_t bufsize = buf.size();
-        auto res = send_packets(p, buf.data(), &bufsize, ecn, n_pkts);
+        auto res = send_packets(p, buf.data(), &bufsize, &ecn, n_pkts, pin_source);
 
         if (res.blocked() and not _manual_routing)
         {
-            socket->when_writeable([this, p, buf = std::move(buf), ecn, cb = std::move(callback)]() mutable {
-                send_or_queue_packet(p, std::move(buf), ecn, std::move(cb));
+            socket->when_writeable([this, p, buf = std::move(buf), ecn, pin_source, cb = std::move(callback)]() mutable {
+                send_or_queue_packet(p, std::move(buf), ecn, pin_source, std::move(cb));
             });
         }
         else if (callback)
@@ -1139,7 +1540,7 @@ namespace oxen::quic
         assert(static_cast<size_t>(nwrite) <= buf.size());
         buf.resize(nwrite);
 
-        send_or_queue_packet(p, std::move(buf), /*ecn=*/0);
+        send_or_queue_packet(p, std::move(buf), /*ecn=*/0, /*pin_source=*/true);
     }
 
     std::shared_ptr<Connection> Endpoint::get_conn(ConnectionID rid)

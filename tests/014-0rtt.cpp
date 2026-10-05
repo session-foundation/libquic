@@ -535,7 +535,11 @@ namespace oxen::quic::test
         auto s_est_fut = s_est_prom.get_future();
         require_future(s_est_fut);
 
-        REQUIRE(incoming_stream->is_ready());
+        // The (empty) stream frame that opens the stream can arrive in a later packet than the one
+        // that completes the handshake, so it may not be open yet when the server sees the
+        // connection established.
+        auto incoming_ready = [&] { return loop.call_get([&] { return incoming_stream && incoming_stream->is_ready(); }); };
+        REQUIRE(wait_for(incoming_ready));
         REQUIRE(incoming_stream->stream_id() == 0);
 
         auto c_est_fut = c_est_prom.get_future();
@@ -597,7 +601,7 @@ namespace oxen::quic::test
 
         require_future(s_est_fut);
         require_future(c_est_fut);
-        REQUIRE(incoming_stream->is_ready());
+        REQUIRE(wait_for(incoming_ready));
         REQUIRE(incoming_stream->stream_id() == 0);
     }
 

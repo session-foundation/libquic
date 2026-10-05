@@ -1284,6 +1284,47 @@ namespace oxen::quic::test
         CHECK(cstream_id == 1);
     }
 
+    TEST_CASE("004 - Stream open callback is not invoked for a queued stream", "[004][streams][queue][open_cb]")
+    {
+        auto [client_tls, server_tls] = defaults::tls_creds_from_ed_keys();
+
+        quic::Loop loop;
+
+        std::atomic<int> open_calls{0};
+        std::promise<int64_t> opened;
+
+        auto server_endpoint = Endpoint::endpoint(loop, Address{});
+        // Declared after the endpoint so that it's destroyed first: a stream's deleter runs on its
+        // endpoint's job queue.
+        std::shared_ptr<Stream> queued;  // loop thread only
+        server_endpoint->listen(
+                server_tls,
+                [&](Connection& c) { queued = c.queue_incoming_stream(); },
+                [&](Stream& s) -> uint64_t {
+                    if (++open_calls == 1)
+                        opened.set_value(s.stream_id());
+                    return 0;
+                });
+
+        RemoteAddress client_remote{defaults::SERVER_PUBKEY, LOCALHOST, server_endpoint->local().port()};
+
+        auto client_endpoint = Endpoint::endpoint(loop, Address{});
+        auto conn = client_endpoint->connect(client_remote, client_tls);
+
+        // The first stream takes the queued stream's id; the second isn't queued, so it gets the
+        // open callback.
+        auto c_str1 = conn->open_stream(opt::stream_notify);
+        auto c_str2 = conn->open_stream(opt::stream_notify);
+
+        auto fut = opened.get_future();
+        require_future(fut);
+        CHECK(fut.get() == 4);
+        CHECK(loop.call_get([&] { return queued && queued->is_ready() && queued->stream_id() == 0; }));
+
+        std::this_thread::sleep_for(50ms);
+        CHECK(open_calls == 1);
+    }
+
     TEST_CASE("004 - Stream FIN", "[004][streams][fin]")
     {
         auto [client_tls, server_tls] = defaults::tls_creds_from_ed_keys();
