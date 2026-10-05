@@ -17,6 +17,8 @@ extern "C"
 #include "utils.hpp"
 
 #include <cstdint>
+#include <memory>
+#include <optional>
 #include <variant>
 
 struct event_base;
@@ -37,6 +39,10 @@ namespace oxen::quic
         Path path;
         ngtcp2_pkt_info pkt_info{};
         std::variant<std::span<const std::byte>, std::vector<std::byte>> pkt_data;
+        // When the packet was received: set for all the packets from one socket read at once, and
+        // otherwise when the endpoint starts handling the packet.  Every step of handling it uses
+        // this one time, as ngtcp2 rejects a connection's time going backwards.
+        std::optional<time_point> received;
 
         size_t size() const
         {
@@ -87,6 +93,16 @@ namespace oxen::quic
 
         UDPSocket() = delete;
 
+        /// Optional socket features, off by default.
+        struct options
+        {
+            /// Send runs of packets as single GSO messages, where libquic was built with GSO
+            /// support and the OS supports it.
+            bool allow_gso = false;
+            /// Receive with UDP GRO, where libquic was built with recvmmsg and the OS supports it.
+            bool allow_gro = false;
+        };
+
         /// Constructs a UDP socket bound to the given address.  Throws if binding fails.  If
         /// binding to an any address (or any port) you can retrieve the realized address via
         /// address() after construction.
@@ -94,7 +110,7 @@ namespace oxen::quic
         /// When packets are received they will be fed into the given callback.
         ///
         /// ev_loop must outlive this object.
-        UDPSocket(event_base* ev_loop, const Address& addr, bool allow_gso, receive_callback_t cb);
+        UDPSocket(event_base* ev_loop, const Address& addr, options opts, receive_callback_t cb);
 
         /// Non-copyable and non-moveable
         UDPSocket(const UDPSocket& s) = delete;
@@ -108,13 +124,24 @@ namespace oxen::quic
         /// packet arrived on).
         const Address& address() const { return bound_; }
 
+        /// Returns the local address this socket would currently use to send to `remote`, or nullopt
+        /// if there is no route to it.  On a socket bound to a specific address that is always the
+        /// bound address; on one bound to the any-address it follows the host's routing, and so can
+        /// change when the host's network does.
+        std::optional<Address> local_address_for(const Address& remote) const;
+
         /// Attempts to send one or more UDP payloads on a single path.  Returns a pair: an
         /// io_result of either success (all packets were sent), `blocked()` if some or all of the
         /// packets could not be sent, or otherwise a `failure()` on more serious errors; and the
         /// number of packets that were actually sent (between 0 and n_pkts).
         ///
         /// Payloads should be packed sequentially starting at `bufs` with the length of each
-        /// payload given by the `bufsize` array.  The given ecn value will be used for the packets.
+        /// payload given by the `bufsize` array, and the ECN value of each packet given by the `ecn`
+        /// array.
+        ///
+        /// If `pin_source` is true and the socket is bound to the any-address, the packets are sent
+        /// from `path.local` (when that is a specific address), as replies must be on a multi-homed
+        /// host; otherwise the OS chooses the source address from its routing.
         ///
         /// If not all packets could be sent because the socket would block it is up to the caller
         /// to deal with it: if such a block occurs it is always the first `n` packets that will
@@ -125,7 +152,12 @@ namespace oxen::quic
         /// retry however much of the send is remaining (via resend()) and, once the send is fully
         /// completed, resuming creation of new packets.
         std::pair<io_result, size_t> send(
-                const Path& path, const std::byte* bufs, const size_t* bufsize, uint8_t ecn, size_t n_pkts);
+                const Path& path,
+                const std::byte* bufs,
+                const size_t* bufsize,
+                const uint8_t* ecn,
+                size_t n_pkts,
+                bool pin_source);
 
         /// Queues a callback to invoke when the UDP socket becomes writeable again.
         ///
@@ -139,13 +171,29 @@ namespace oxen::quic
         ~UDPSocket();
 
       private:
-        void process_packet(std::span<const std::byte> payload, msghdr& hdr);
+        // Passes on every packet in one received buffer (several, if GRO merged them), stamped with
+        // `received`, returning how many there were.
+        size_t process_received(std::span<const std::byte> data, msghdr& hdr, std::optional<time_point> received);
         io_result receive();
+
+        // Test hook, only functional in debug builds of libquic: makes this socket's upcoming sends
+        // fail, in order, with `gso_errors` (for sends made using GSO) and `plain_errors` (for
+        // sends made without it).  Returns false if unsupported.
+        bool _debug_fail_sends(std::vector<int> gso_errors, std::vector<int> plain_errors);
+        // Test hook, only functional in debug builds of libquic: returns how many received buffers
+        // held more than one packet merged by GRO, or nullopt if unsupported.
+        std::optional<size_t> _debug_gro_merges() const;
 
         socket_t sock_;
         Address bound_;
 
         bool gso_;
+        bool gro_ = false;
+
+        // The buffers recvmmsg receives into (null without recvmmsg support), allocated once rather
+        // than on the stack, which they are too large for.
+        struct receive_batch;
+        std::unique_ptr<receive_batch> recv_;
 
         event_base* ev_ = nullptr;
 
