@@ -12,7 +12,6 @@
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
 
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <concepts>
@@ -84,6 +83,8 @@ namespace oxen::quic
         //          the default will be set
         //      default_handshake_timeout: the default timeout for handshaking for the endpoint
         //          (individual connections might have this overridden via connect option).
+        //      now: the connection's starting time; for an inbound connection, when the packet that
+        //          opens it was received.
         //      remote_pk: optional parameter used by clients to verify the pubkey of the remote
         //          endpoint during handshake negotiation. For servers, omit this parameter or
         //          pass std::nullopt
@@ -97,11 +98,11 @@ namespace oxen::quic
                 std::shared_ptr<IOContext> ctx,
                 std::span<const std::string> alpns,
                 std::chrono::nanoseconds default_handshake_timeout,
+                time_point now,
                 std::optional<std::vector<unsigned char>> remote_pk = std::nullopt,
                 ngtcp2_pkt_hd* hdr = nullptr,
                 std::optional<ngtcp2_token_type> token_type = std::nullopt,
-                ngtcp2_cid* ocid = nullptr,
-                std::optional<size_t> max_udp_payload = std::nullopt);
+                ngtcp2_cid* ocid = nullptr);
 
         TLSSession* get_session() const { return tls_session.get(); }
         TLSCreds* get_creds() const { return tls_creds.get(); }
@@ -117,8 +118,9 @@ namespace oxen::quic
         /// Queues an incoming stream of the given StreamT type, forwarding the given arguments to
         /// the StreamT constructor.  The stream will be given the next unseen incoming connection
         /// ID; it will be made ready once the associated stream id is seen from the remote
-        /// connection.  Note that this constructor bypasses the stream constructor callback for the
-        /// applicable stream id.
+        /// connection.  This is an alternative to handling the stream in the stream open callback:
+        /// that callback is *not* invoked when a queued stream opens.  Note that this constructor
+        /// also bypasses the stream constructor callback for the applicable stream id.
         template <std::derived_from<Stream> StreamT, typename... Args, typename EndpointDeferred = Endpoint>
         std::shared_ptr<StreamT> queue_incoming_stream(Args&&... args)
         {
@@ -133,7 +135,8 @@ namespace oxen::quic
         /// Queues a default incoming Stream object, either via the stream constructor callback (if
         /// set) or the default Stream constructor (if no constructor callback, or the callback
         /// returns nullptr).  The stream object will be made ready once the associated next
-        /// incoming stream ID is observed from the other end.
+        /// incoming stream ID is observed from the other end.  As with the templated version, the
+        /// stream open callback is not invoked when a queued stream opens.
         std::shared_ptr<Stream> queue_incoming_stream();
 
         /// Opens a new outgoing stream to the other end of the connection of the given StreamT
@@ -376,11 +379,11 @@ namespace oxen::quic
                 std::shared_ptr<IOContext> ctx,
                 std::span<const std::string> alpns,
                 std::chrono::nanoseconds default_handshake_timeout,
+                time_point now,
                 std::optional<std::vector<unsigned char>> remote_pk = std::nullopt,
                 ngtcp2_pkt_hd* hdr = nullptr,
                 std::optional<ngtcp2_token_type> token_type = std::nullopt,
-                ngtcp2_cid* ocid = nullptr,
-                std::optional<size_t> max_udp_payload = std::nullopt);
+                ngtcp2_cid* ocid = nullptr);
 
         Endpoint& _endpoint;
         Loop& _loop;
@@ -454,14 +457,55 @@ namespace oxen::quic
         void on_packet_io_ready();
 
         struct pkt_tx_timer_updater;
-        bool send(pkt_tx_timer_updater* pkt_updater = nullptr);
+        bool send(pkt_tx_timer_updater& pkt_updater);
 
-        void flush_packets(std::chrono::steady_clock::time_point tp);
+        // Returns false if the endpoint's send batch is stalled on a blocked socket, in which case
+        // this connection gets woken once the stall clears and the caller should leave re-arming
+        // the retransmit timer until then.
+        [[nodiscard]] bool flush_packets(std::chrono::steady_clock::time_point tp);
 
-        std::array<std::byte, MAX_PMTUD_UDP_PAYLOAD * DATAGRAM_BATCH_SIZE> send_buffer;
-        std::array<size_t, DATAGRAM_BATCH_SIZE> send_buffer_size;
-        uint8_t send_ecn = 0;
-        size_t n_packets = 0;
+        // True while this connection is in the endpoint's list of connections waiting for a send
+        // stall to clear.
+        bool waiting_on_stall = false;
+
+        // Called when a packet of `size` bytes was dropped because the socket refused it as too big
+        // for the path (EMSGSIZE): ignored for a PMTUD probe.  For any packet within the path size
+        // ngtcp2 has confirmed, an outbound connection whose local address has changed migrates
+        // (or will, once it has a spare connection ID); otherwise the connection closes.  `ts` is
+        // the timestamp for any ngtcp2 call this makes.
+        void packet_too_big(size_t size, uint64_t ts);
+
+        // The last local address a packet arrived on, other than _path.local, that turned out not
+        // to mean the host's source address had changed (e.g. asymmetric routing), so that further
+        // packets arriving there don't each repeat the lookup.
+        std::optional<Address> _unconfirmed_local;
+
+        // The local address the host now sends from, when the connection couldn't migrate to it for
+        // want of a spare connection ID.  Those only ever arrive in packets, so the migration is
+        // retried after each packet is read.
+        std::optional<Address> _pending_local;
+
+        // Called (on an outbound connection) when a packet arrives on a local address other than
+        // _path.local; `ts` is the packet's receive time.
+        void local_address_mismatch(const Address& arrived_on, uint64_t ts);
+
+        // What check_local_address() and migrate_local() did.
+        enum class local_check {
+            unchanged,  // the connection stays on _path.local: the host still sends from it, the
+                        // route couldn't be looked up, or ngtcp2 won't migrate this connection
+            migrated,
+            pending,  // the host sends from a new address, but migrating waits for a connection ID
+        };
+
+        // If the host would now reach the peer from a different local address than _path.local
+        // (i.e. the host's network changed), migrates the connection to it.  Called during a flush,
+        // `ts` must be the flush's timestamp, which ngtcp2 goes on to be given for the rest of the
+        // flush.
+        local_check check_local_address(uint64_t ts = get_timestamp().count());
+
+        // Migrates the connection to `local` as its local address, or leaves it as _pending_local if
+        // there is no spare connection ID yet.  (By value: it may be passed _pending_local itself.)
+        local_check migrate_local(Address local, uint64_t ts);
 
         void schedule_packet_retransmit(std::chrono::steady_clock::time_point ts);
 
@@ -516,7 +560,7 @@ namespace oxen::quic
                 ngtcp2_transport_params& params,
                 ngtcp2_callbacks& callbacks,
                 std::chrono::nanoseconds handshake_timeout,
-                std::optional<size_t> max_udp_payload);
+                time_point now);
 
         io_result read_packet(const Packet& pkt);
 

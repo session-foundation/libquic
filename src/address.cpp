@@ -46,28 +46,10 @@ namespace oxen::quic
 
     Address::Address(const ngtcp2_addr& addr)
     {
-        // if (addr.addrlen == sizeof(sockaddr_in6))
-        if (addr.addr->sa_family == AF_INET6)
-        {
-            _sock_addr.ss_family = AF_INET6;
-            auto& sin6 = reinterpret_cast<sockaddr_in6&>(_sock_addr);
-            auto& nin6 = reinterpret_cast<const sockaddr_in6&>(addr);
-            sin6.sin6_addr = nin6.sin6_addr;
-            sin6.sin6_port = nin6.sin6_port;
-            update_socklen(sizeof(sockaddr_in6));
-        }
-        // else if (addr.addrlen == sizeof(sockaddr_in))
-        else if (addr.addr->sa_family == AF_INET)
-        {
-            _sock_addr.ss_family = AF_INET;
-            auto& sin = reinterpret_cast<sockaddr_in&>(_sock_addr);
-            auto& nin = reinterpret_cast<const sockaddr_in&>(addr);
-            sin.sin_addr = nin.sin_addr;
-            sin.sin_port = nin.sin_port;
-            update_socklen(sizeof(sockaddr_in));
-        }
-        else
+        if (addr.addr->sa_family != AF_INET6 && addr.addr->sa_family != AF_INET)
             throw std::invalid_argument{"What on earth did you pass to this constructor?"};
+        std::memcpy(&_sock_addr, addr.addr, addr.addrlen);
+        update_socklen(addr.addrlen);
     }
 
     Address::Address(const ipv4& v4, uint16_t port)

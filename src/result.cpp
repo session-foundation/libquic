@@ -33,6 +33,8 @@ namespace oxen::quic
                 return "Error - Failed to send packet"s;
             case CONN_IDLE_CLOSED:
                 return "Connection closed by idle timeout"s;
+            case CONN_MTU_EXCEEDED:
+                return "Connection closed because the path can no longer carry its packets"s;
             default:
                 return "Application error code {}"_format(e);
         }
