@@ -1,3 +1,51 @@
+oxen-libquic (1.11.0-1~deb14) forky; urgency=medium
+
+  * ci-upload: upload .ddeb debug packages and .buildinfo files
+  * Make the packet batching compile definitions private
+  * Send each batched packet with its own ECN marking
+  * Make room for every received control message so ECN isn't lost
+  * Share one send buffer per endpoint instead of one per connection
+  * Test the endpoint send stall with a debug-only blocked-socket hook
+  * Test discarding a stalled batch whose connection goes away
+  * Test partly sent batches with a debug-only partial send hook
+  * Fix a deadlock in the simultaneous-connection handshake test
+  * Wait for the 0-RTT test's incoming stream to open instead of assuming it
+  * Document that queued streams don't get the stream open callback
+  * Bump version to 1.11.0
+  * Let a GSO batch end with one shorter packet
+  * Retry once when sendmmsg sends only some of a batch
+  * Drop packets on EMSGSIZE and ENOBUFS instead of closing the connection
+  * Fall back to sending without GSO when a GSO send fails with EIO or EINVAL
+  * Require ngtcp2 1.4.0
+  * Raise the max UDP payload to 1472 and honour the cap with datagrams
+  * Probe our own list of PMTUD sizes, configurable through opt::max_udp_payload
+  * Skip probe sizes above 1452 on IPv6 connections
+  * Close a connection when the path refuses a packet within its confirmed size
+  * Set don't-fragment on UDP sockets
+  * Make pinning the source address an explicit choice of the sender
+  * Add UDPSocket::local_address_for to find the local address used to reach a peer
+  * Label outbound connection paths with the source address actually used
+  * Fix constructing an Address from an ngtcp2_addr
+  * Migrate an outbound connection when the host's source address changes
+  * Add Endpoint::network_changed for applications to report a network change
+  * Migrate rather than close when a refused packet follows a source address change
+  * Require ngtcp2 1.26.0 from the system, and patch the bundled 1.25.0
+  * Test that asymmetric routing doesn't migrate a connection
+  * Retry a migration that has to wait for a spare connection ID
+  * Test a client migrating after the server has followed its new address
+  * Add a -G/--gso flag to the speedtest client and server
+  * Size the speedtest client's datagram queue to hold the whole test
+  * Receive into socket-owned buffers, MAX_RECEIVE_PER_LOOP packets at a time
+  * Take UDPSocket's GSO choice in an options struct
+  * Add UDP GRO receiving, enabled with opt::allow_gro
+  * Parse a received buffer's control messages once, not once per GRO packet
+  * Time received packets once per recvmmsg call, not once per packet
+  * Remember the last connection fetch_associated_conn found
+  * Migrate CI from .drone.jsonnet to Woodpecker Starlark
+  * Build the Ubuntu 24.04 CI job in the noble image
+
+ -- Jason Rhinelander <jason@session.foundation>  Mon, 05 Oct 2026 18:52:03 -0300
+
 oxen-libquic (1.10.2-2~deb14) forky; urgency=medium
 
   * Depend on at least the ngtcp2 we built against
