@@ -44,6 +44,12 @@ extern "C"
 #include <variant>
 #include <vector>
 
+#ifndef NDEBUG
+#include <deque>
+#include <mutex>
+#include <unordered_map>
+#endif
+
 #ifdef _WIN32
 
 #define CMSG_FIRSTHDR(h) WSA_CMSG_FIRSTHDR(h)
@@ -62,8 +68,53 @@ extern "C"
 
 #endif
 
+// We support different compilation modes for trying different methods of UDP sending by setting
+// these defines; these shouldn't be set directly but rather through the cmake -DLIBQUIC_SEND
+// option.  At most one of these may be defined.
+//
+// OXEN_LIBQUIC_UDP_GSO -- support use either sendmmsg or GSO to batch-send packets.  GSO
+// support can be opted-in at runtime.  Only works on Linux, and not always (i.e. depends on
+// hardware and software support).  Will fall back to SENDMMSG if the required UDP_SEGMENT is
+// not defined (i.e. on older Linux distros), or if GSO is not selected at runtime.
+// CMake option: -DLIBQUIC_SEND=gso
+//
+// OXEN_LIBQUIC_UDP_SENDMMSG -- use sendmmsg (but not GSO) to batch-send packets.  Only works on
+// Linux and FreeBSD.
+// CMake option: -DLIBQUIC_SEND=sendmmsg
+//
+// If neither is defined we use plain sendmsg in a loop.
+
+#if (defined(OXEN_LIBQUIC_UDP_GSO) + defined(OXEN_LIBQUIC_UDP_SENDMMSG)) > 1
+#error Only one of OXEN_LIBQUIC_UDP_GSO and OXEN_LIBQUIC_UDP_SENDMMSG may be set at once
+#endif
+
+#if defined(OXEN_LIBQUIC_UDP_GSO) && !defined(UDP_SEGMENT)
+#undef OXEN_LIBQUIC_UDP_GSO
+#define OXEN_LIBQUIC_UDP_SENDMMSG
+#endif
+
+// Receiving with GRO is only implemented for recvmmsg, and needs UDP_GRO from the system headers.
+#if defined(OXEN_LIBQUIC_RECVMMSG) && defined(UDP_GRO)
+#define OXEN_LIBQUIC_UDP_GRO
+#endif
+
 namespace oxen::quic
 {
+
+#ifdef OXEN_LIBQUIC_UDP_GSO
+    constexpr bool GSO_SUPPORTED = true;
+#else
+    constexpr bool GSO_SUPPORTED = false;
+#endif
+
+#ifdef OXEN_LIBQUIC_UDP_GRO
+    // Each GRO buffer can hold many packets, so a few large slots replace the usual one-packet
+    // ones.  8 x 64kB still fits in many CPUs' per-core L2 cache, so a full batch hasn't been
+    // evicted by the time we process it.
+    constexpr size_t GRO_SLOTS = 8;
+    // The kernel never merges more than fits in one IP packet (whose length is 16 bits).
+    constexpr size_t GRO_SLOT_SIZE = 64_ki;
+#endif
 
 #ifdef _WIN32
     static_assert(std::is_same_v<UDPSocket::socket_t, SOCKET>);
@@ -80,6 +131,63 @@ namespace oxen::quic
             IP_TOS;
 #endif
 #endif
+
+#ifndef NDEBUG
+    // State for UDPSocket's test hooks, kept here rather than in UDPSocket so that the class's
+    // layout doesn't depend on the build type.
+    namespace
+    {
+        struct send_failures
+        {
+            std::deque<int> gso, plain;
+        };
+        std::mutex debug_send_failures_mutex;
+        std::unordered_map<const UDPSocket*, send_failures> debug_send_failures;
+
+        std::mutex debug_gro_merges_mutex;
+        std::unordered_map<const UDPSocket*, size_t> debug_gro_merges;
+
+        // Returns the next error queued for a GSO (or non-GSO) send on `sock`, or 0 if none.
+        int take_debug_send_failure(const UDPSocket* sock, bool gso)
+        {
+            std::lock_guard lock{debug_send_failures_mutex};
+            auto it = debug_send_failures.find(sock);
+            if (it == debug_send_failures.end())
+                return 0;
+            auto& q = gso ? it->second.gso : it->second.plain;
+            if (q.empty())
+                return 0;
+            int err = q.front();
+            q.pop_front();
+            return err;
+        }
+    }  // namespace
+#endif
+
+    bool UDPSocket::_debug_fail_sends(
+            [[maybe_unused]] std::vector<int> gso_errors, [[maybe_unused]] std::vector<int> plain_errors)
+    {
+#ifndef NDEBUG
+        std::lock_guard lock{debug_send_failures_mutex};
+        auto& f = debug_send_failures[this];
+        f.gso.insert(f.gso.end(), gso_errors.begin(), gso_errors.end());
+        f.plain.insert(f.plain.end(), plain_errors.begin(), plain_errors.end());
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    std::optional<size_t> UDPSocket::_debug_gro_merges() const
+    {
+#ifndef NDEBUG
+        std::lock_guard lock{debug_gro_merges_mutex};
+        auto it = debug_gro_merges.find(this);
+        return it == debug_gro_merges.end() ? 0 : it->second;
+#else
+        return std::nullopt;
+#endif
+    }
 
     /// Checks rv for being -1 and, if so, raises a system_error from errno.  Otherwise returns it.
     static int check_rv(int rv, std::string_view action)
@@ -116,6 +224,69 @@ namespace oxen::quic
 #endif
         if (ec)
             log::error(log_cat, "Got error {} ({}) during {}", ec->value(), ec->message(), action);
+    }
+
+    // QUIC packets must not be fragmented (RFC 9000 §14).  With fragmentation, PMTUD can confirm a
+    // size that the path only carries in pieces, and a packet too big for the path goes out in
+    // fragments rather than being refused with EMSGSIZE.  This is best effort: where an option is
+    // unavailable the OS default applies.
+    static void set_dont_fragment(UDPSocket::socket_t sock, bool ipv6, bool dual_stack)
+    {
+        [[maybe_unused]] auto set = [sock](int level, int opt, int value, std::string_view what, bool required) {
+#ifdef _WIN32
+            const DWORD v = value;
+            const auto* p = reinterpret_cast<const char*>(&v);
+#else
+            const int v = value;
+            const auto* p = &v;
+#endif
+            int rv = setsockopt(sock, level, opt, p, sizeof(v));
+            if (rv == 0)
+                return;
+            if (!required)
+                log::debug(log_cat, "Unable to enable {} on a dual-stack socket", what);
+            else
+            {
+#ifdef __APPLE__
+                // Only a warning: systems before macOS 11 / iOS 14 don't have IP_DONTFRAG, even
+                // when built with an SDK that defines it.
+                log::warning(
+                        log_cat,
+                        "Unable to enable {} ({}); packets may be fragmented",
+                        what,
+                        std::error_code{errno, std::system_category()}.message());
+#else
+                log_rv_error(rv, what);
+#endif
+            }
+        };
+
+        // A dual-stack IPv6 socket sends to IPv4(-mapped) addresses under the IPv4 options, which not
+        // every OS lets an IPv6 socket set.
+        [[maybe_unused]] const bool v4 = !ipv6 || dual_stack;
+        [[maybe_unused]] const bool v4_required = !ipv6;
+#if defined(_WIN32)
+        if (v4)
+            set(IPPROTO_IP, IP_DONTFRAGMENT, 1, "IP_DONTFRAGMENT", v4_required);
+        if (ipv6)
+            set(IPPROTO_IPV6, IPV6_DONTFRAG, 1, "IPV6_DONTFRAG", true);
+#elif defined(IP_MTU_DISCOVER) && defined(IP_PMTUDISC_PROBE)
+        // PROBE rather than DO: both set DF, but DO also makes sends fail with EMSGSIZE once ICMP
+        // (which anyone who can guess the addresses can forge) reports a smaller path MTU, and an
+        // EMSGSIZE for an ordinary packet closes the connection.  With PROBE it only reflects the
+        // local interface's MTU.
+        if (v4)
+            set(IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_PROBE, "IP_MTU_DISCOVER", v4_required);
+        if (ipv6)
+            set(IPPROTO_IPV6, IPV6_MTU_DISCOVER, IPV6_PMTUDISC_PROBE, "IPV6_MTU_DISCOVER", true);
+#elif defined(IP_DONTFRAG)
+        if (v4)
+            set(IPPROTO_IP, IP_DONTFRAG, 1, "IP_DONTFRAG", v4_required);
+#ifdef IPV6_DONTFRAG
+        if (ipv6)
+            set(IPPROTO_IPV6, IPV6_DONTFRAG, 1, "IPV6_DONTFRAG", true);
+#endif
+#endif
     }
 
 #ifdef _WIN32
@@ -168,8 +339,64 @@ namespace oxen::quic
     }
 #endif
 
-    UDPSocket::UDPSocket(event_base* ev_loop, const Address& addr, bool allow_gso, receive_callback_t on_receive) :
-            gso_{allow_gso}, ev_{ev_loop}, receive_callback_{std::move(on_receive)}
+    // This needs room for every control message we enable on the socket at once: the kernel
+    // silently drops whichever ones don't fit (setting MSG_CTRUNC), and Linux delivers pktinfo
+    // before the TOS/TCLASS ECN value, so undersizing this loses the ECN value on every packet.
+    // (Dual-stack Windows sockets deliver both pktinfo types).
+    struct alignas(cmsghdr) recv_cmsg_data
+    {
+        char ecn[CMSG_SPACE(sizeof(int))];  // a char most places but an int on windows because yay
+        char pktinfo4[CMSG_SPACE(sizeof(in_pktinfo))];
+        char pktinfo6[CMSG_SPACE(sizeof(in6_pktinfo))];
+#ifdef OXEN_LIBQUIC_UDP_GRO
+        char gro[CMSG_SPACE(sizeof(int))];
+#endif
+    };
+
+    struct UDPSocket::receive_batch
+    {
+#ifdef OXEN_LIBQUIC_RECVMMSG
+        receive_batch(size_t slots, size_t slot_size) :
+                slot_size{slot_size}, data(slots * slot_size), peers(slots), iovs(slots), msgs(slots), cmsgs(slots)
+        {
+            for (size_t i = 0; i < slots; i++)
+            {
+                iovs[i].iov_base = slot(i);
+                iovs[i].iov_len = slot_size;
+                auto& h = msgs[i].msg_hdr;
+                h.msg_iov = &iovs[i];
+                h.msg_iovlen = 1;
+                h.msg_name = &peers[i];
+                h.msg_control = &cmsgs[i];
+            }
+        }
+
+        const size_t slot_size;
+        std::vector<std::byte> data;
+        std::vector<sockaddr_in6> peers;
+        std::vector<iovec> iovs;
+        std::vector<mmsghdr> msgs;
+        std::vector<recv_cmsg_data> cmsgs;
+
+        std::byte* slot(size_t i) { return data.data() + i * slot_size; }
+
+        // The kernel overwrites each message's address and control lengths, and its flags, with
+        // what the packet it received used, so they need resetting before every call.
+        void reset()
+        {
+            for (size_t i = 0; i < msgs.size(); i++)
+            {
+                auto& h = msgs[i].msg_hdr;
+                h.msg_namelen = sizeof(peers[i]);
+                h.msg_controllen = sizeof(cmsgs[i]);
+                h.msg_flags = 0;
+            }
+        }
+#endif
+    };
+
+    UDPSocket::UDPSocket(event_base* ev_loop, const Address& addr, options opts, receive_callback_t on_receive) :
+            gso_{GSO_SUPPORTED && opts.allow_gso}, ev_{ev_loop}, receive_callback_{std::move(on_receive)}
     {
         assert(ev_);
 
@@ -200,6 +427,8 @@ namespace oxen::quic
             const auto* v6only = addr.dual_stack ? sockopt_off_ptr : sockopt_on_ptr;
             check_rv(setsockopt(sock_, IPPROTO_IPV6, IPV6_V6ONLY, v6only, sockopt_onoff_size), "setting v6only flag");
         }
+
+        set_dont_fragment(sock_, addr.is_ipv6(), addr.dual_stack);
 
         // Enable ECN notification on packets we receive:
 #ifndef _WIN32
@@ -270,6 +499,24 @@ namespace oxen::quic
         check_rv(fcntl(sock_, F_SETFL, O_NONBLOCK), "set non-blocking");
 #endif
 
+#ifdef OXEN_LIBQUIC_RECVMMSG
+        size_t recv_slots = MAX_RECEIVE_PER_LOOP, recv_slot_size = MAX_PMTUD_UDP_PAYLOAD;
+#ifdef OXEN_LIBQUIC_UDP_GRO
+        if (opts.allow_gro)
+        {
+            if (setsockopt(sock_, IPPROTO_UDP, UDP_GRO, &sockopt_on, sizeof(sockopt_on)) == 0)
+            {
+                gro_ = true;
+                recv_slots = GRO_SLOTS;
+                recv_slot_size = GRO_SLOT_SIZE;
+            }
+            else
+                log::warning(log_cat, "Unable to enable UDP GRO ({}); receiving without it", std::strerror(errno));
+        }
+#endif
+        recv_ = std::make_unique<receive_batch>(recv_slots, recv_slot_size);
+#endif
+
         rev_.reset(event_new(
                 ev_,
                 sock_,
@@ -314,16 +561,63 @@ namespace oxen::quic
 #else
         ::close(sock_);
 #endif
+#ifndef NDEBUG
+        {
+            std::lock_guard lock{debug_send_failures_mutex};
+            debug_send_failures.erase(this);
+        }
+        std::lock_guard lock{debug_gro_merges_mutex};
+        debug_gro_merges.erase(this);
+#endif
     }
 
-    void UDPSocket::process_packet(std::span<const std::byte> payload, msghdr& hdr)
+    std::optional<Address> UDPSocket::local_address_for(const Address& remote) const
     {
-        if (payload.empty())
+        if (!bound_.is_any_addr())
+            return bound_;
+
+        // A dual-stack socket reaches IPv4 peers at IPv4-mapped addresses, but not every OS lets an
+        // IPv6 socket connect to one (Windows and some BSDs default to IPV6_V6ONLY), so we look up
+        // the plain IPv4 address and map the answer back.
+        const bool mapped = remote.is_ipv4_mapped_ipv6();
+        const auto target = mapped ? remote.unmapped_ipv4_from_ipv6() : remote;
+
+        // Connecting a UDP socket sends nothing, but makes the kernel choose the source address that
+        // a send to `target` would use.
+        auto sock = ::socket(target.is_ipv6() ? AF_INET6 : AF_INET, SOCK_DGRAM, 0);
+#ifdef _WIN32
+        if (sock == INVALID_SOCKET)
+#else
+        if (sock == -1)
+#endif
+            return std::nullopt;
+
+        std::optional<Address> source;
+        auto addr = target.is_ipv6() ? Address{ipv6{}} : Address{ipv4{}};
+        if (::connect(sock, target, target.socklen()) == 0 && ::getsockname(sock, addr, addr.socklen_ptr()) == 0)
+        {
+            if (mapped)
+                addr.map_ipv4_as_ipv6();
+            addr.set_port(bound_.port());
+            source = addr;
+        }
+
+#ifdef _WIN32
+        ::closesocket(sock);
+#else
+        ::close(sock);
+#endif
+        return source;
+    }
+
+    size_t UDPSocket::process_received(std::span<const std::byte> data, msghdr& hdr, std::optional<time_point> received)
+    {
+        if (data.empty())
         {
             // This is unexpected, and not something a proper libquic client would ever send so
             // just drop it.
             log::warning(log_cat, "Dropping empty UDP packet");
-            return;
+            return 0;
         }
 
         // This flag means the packet payload couldn't fit in max_payload_size, but that should
@@ -337,53 +631,66 @@ namespace oxen::quic
         )
         {
             log::warning(log_cat, "Dropping truncated UDP packet");
-            return;
+            return 1;
         }
 
-        receive_callback_(Packet{bound_, payload, hdr});
-    }
+        // The addresses and ECN value apply equally to every packet GRO merged, so the control
+        // messages are only parsed once.
+        Packet pkt{bound_, data, hdr};
+        pkt.received = received;
 
-    union alignas(cmsghdr) recv_cmsg_data
-    {
-        char ecn[CMSG_SPACE(sizeof(int))];  // a char most places but an int on windows because yay
-        char pktinfo4[CMSG_SPACE(sizeof(in_pktinfo))];
-        char pktinfo6[CMSG_SPACE(sizeof(in6_pktinfo))];
-    };
+        // GRO merges packets of the size it reports here, except that the last may be shorter.
+        size_t segment = 0;
+#ifdef OXEN_LIBQUIC_UDP_GRO
+        if (gro_)
+            for (auto* cm = CMSG_FIRSTHDR(&hdr); cm; cm = CMSG_NXTHDR(&hdr, cm))
+                if (cm->cmsg_level == IPPROTO_UDP && cm->cmsg_type == UDP_GRO)
+                {
+                    int size;
+                    std::memcpy(&size, CMSG_DATA(cm), sizeof(size));
+                    segment = static_cast<size_t>(size);
+                }
+#endif
+        if (segment == 0 || data.size() <= segment)
+        {
+            receive_callback_(std::move(pkt));
+            return 1;
+        }
+
+        size_t n = 0;
+        for (; !data.empty(); n++)
+        {
+            auto len = std::min(segment, data.size());
+            Packet seg{pkt.path, data.first(len)};
+            seg.pkt_info = pkt.pkt_info;
+            seg.received = received;
+            receive_callback_(std::move(seg));
+            data = data.subspan(len);
+        }
+#ifndef NDEBUG
+        std::lock_guard lock{debug_gro_merges_mutex};
+        debug_gro_merges[this]++;
+#endif
+        return n;
+    }
 
     io_result UDPSocket::receive()
     {
 #ifdef OXEN_LIBQUIC_RECVMMSG
-        std::array<sockaddr_in6, DATAGRAM_BATCH_SIZE> peers;
-        std::array<iovec, DATAGRAM_BATCH_SIZE> iovs;
-        std::array<mmsghdr, DATAGRAM_BATCH_SIZE> msgs = {};
-        std::array<recv_cmsg_data, DATAGRAM_BATCH_SIZE> cmsgs = {};
-
-        std::array<std::array<std::byte, MAX_PMTUD_UDP_PAYLOAD>, DATAGRAM_BATCH_SIZE> data;
-
-        for (size_t i = 0; i < DATAGRAM_BATCH_SIZE; i++)
-        {
-            iovs[i].iov_base = data[i].data();
-            iovs[i].iov_len = data[i].size();
-            auto& h = msgs[i].msg_hdr;
-            h.msg_iov = &iovs[i];
-            h.msg_iovlen = 1;
-            h.msg_name = &peers[i];
-            h.msg_namelen = sizeof(peers[i]);
-            h.msg_control = &cmsgs[i];
-            h.msg_controllen = sizeof(cmsgs[i]);
-        }
-
+        // Without GRO the batch holds MAX_RECEIVE_PER_LOOP packets, so the first call reaches the
+        // limit.  With it, each slot can hold many packets: we keep going while calls fill every
+        // slot, so we can end up some way past the limit.
+        auto& b = *recv_;
         size_t count = 0;
         do
         {
+            b.reset();
+
             int nread;
             do
             {
-                nread = recvmmsg(sock_, msgs.data(), msgs.size(), 0, nullptr);
+                nread = recvmmsg(sock_, b.msgs.data(), b.msgs.size(), 0, nullptr);
             } while (nread == -1 && errno == EINTR);
-
-            if (nread == 0)  // No packets available to read
-                return io_result{};
 
             if (nread < 0)
             {
@@ -392,15 +699,12 @@ namespace oxen::quic
                 return io_result{errno};
             }
 
+            auto received = get_time();
             for (int i = 0; i < nread; i++)
-                process_packet(std::span{data[i].data(), msgs[i].msg_len}, msgs[i].msg_hdr);
+                count += process_received(std::span{b.slot(i), b.msgs[i].msg_len}, b.msgs[i].msg_hdr, received);
 
-            count += nread;
-
-            if (nread < static_cast<int>(DATAGRAM_BATCH_SIZE))
-                // We didn't fill the recvmmsg array so must be done
-                return io_result{};
-
+            if (static_cast<size_t>(nread) < b.msgs.size())
+                break;  // The socket is drained
         } while (count < MAX_RECEIVE_PER_LOOP);
 
         return io_result{};
@@ -465,7 +769,7 @@ namespace oxen::quic
             }
 #endif
 
-            process_packet(std::span{data.data(), static_cast<size_t>(nbytes)}, hdr);
+            process_received(std::span{data.data(), static_cast<size_t>(nbytes)}, hdr, std::nullopt);
 
             count++;
 
@@ -501,39 +805,19 @@ namespace oxen::quic
         return CMSG_SPACE(sizeof(ecn));
     }
 
-    // We support different compilation modes for trying different methods of UDP sending by setting
-    // these defines; these shouldn't be set directly but rather through the cmake -DLIBQUIC_SEND
-    // option.  At most one of these may be defined.
-    //
-    // OXEN_LIBQUIC_UDP_GSO -- support use either sendmmsg or GSO to batch-send packets.  GSO
-    // support can be opted-in at runtime.  Only works on Linux, and not always (i.e. depends on
-    // hardware and software support).  Will fall back to SENDMMSG if the required UDP_SEGMENT is
-    // not defined (i.e. on older Linux distros), or if GSO is not selected at runtime.
-    // CMake option: -DLIBQUIC_SEND=gso
-    //
-    // OXEN_LIBQUIC_UDP_SENDMMSG -- use sendmmsg (but not GSO) to batch-send packets.  Only works on
-    // Linux and FreeBSD.
-    // CMake option: -DLIBQUIC_SEND=sendmmsg
-    //
-    // If neither is defined we use plain sendmsg in a loop.
-
-#if (defined(OXEN_LIBQUIC_UDP_GSO) + defined(OXEN_LIBQUIC_UDP_SENDMMSG)) > 1
-#error Only one of OXEN_LIBQUIC_UDP_GSO and OXEN_LIBQUIC_UDP_SENDMMSG may be set at once
-#endif
-
-#if defined(OXEN_LIBQUIC_UDP_GSO) && !defined(UDP_SEGMENT)
-#undef OXEN_LIBQUIC_UDP_GSO
-#define OXEN_LIBQUIC_UDP_SENDMMSG
-#endif
-
     std::pair<io_result, size_t> UDPSocket::send(
-            const Path& path, const std::byte* buf, const size_t* bufsize, uint8_t ecn, size_t n_pkts)
+            const Path& path,
+            const std::byte* buf,
+            const size_t* bufsize,
+            const uint8_t* ecn,
+            size_t n_pkts,
+            bool pin_source)
     {
         auto* next_buf = const_cast<char*>(reinterpret_cast<const char*>(buf));
         int rv = 0;
         size_t sent = 0;
 
-        const bool set_source_addr = bound_.is_any_addr() && !path.local.is_any_addr();
+        const bool set_source_addr = pin_source && bound_.is_any_addr() && !path.local.is_any_addr();
 
 #ifdef _WIN32
         // On Windows, when using a dual-stack socket, IPv4 destinations must always be
@@ -573,14 +857,18 @@ namespace oxen::quic
 
 #ifdef OXEN_LIBQUIC_UDP_GSO
 
+        // Set if the GSO send failed in a way that falls back to sending without GSO, below.
+        int gso_error = 0;
+
         if (gso_)
         {
 
             // With GSO, we use *one* sendmmsg call which can contain multiple batches of packets; each
-            // batch is of size n, where each of the n have the same size.
+            // batch is of size n, where each of the n have the same size and ECN value (the ECN cmsg
+            // applies to every segment of the batch), except that the last one may be shorter.
             //
             // We could have up to the full MAX_BATCH, with the worst case being every packet being a
-            // different size than the one before it.
+            // different size or ECN value than the one before it.
             alignas(cmsghdr) std::array<
                     std::array<
                             char,
@@ -594,22 +882,31 @@ namespace oxen::quic
             std::array<iovec, MAX_BATCH> iovs{};
 
             unsigned int msg_count = 0;
+            size_t batch_bytes = 0;
             for (size_t i = 0; i < n_pkts; i++)
             {
                 auto& gso_size = gso_sizes[msg_count];
                 auto& gso_count = gso_counts[msg_count];
                 gso_count++;
+                batch_bytes += bufsize[i];
                 if (gso_size == 0)
                     gso_size = bufsize[i];  // new batch
 
-                if (i < n_pkts - 1 && bufsize[i + 1] == gso_size)
-                    continue;  // The next one can be batched with us
+                // The next packet can join this batch if it's the same size or, once we have at least
+                // two full-size packets, if it's shorter (it then has to be the last one).  Not
+                // allowing a short packet after just one means a lone PMTUD probe (always larger than
+                // everything else) can never start a batch, which would take the following packet
+                // down with it when the kernel rejects the whole oversized message with EINVAL.
+                if (i < n_pkts - 1 && bufsize[i] == gso_size && ecn[i + 1] == ecn[i] &&
+                    (bufsize[i + 1] == gso_size || (bufsize[i + 1] < gso_size && gso_count >= 2)))
+                    continue;
 
                 auto& iov = iovs[msg_count];
                 auto& msg = msgs[msg_count];
                 auto& control = controls[msg_count];
                 iov.iov_base = next_buf;
-                iov.iov_len = gso_count * gso_size;
+                iov.iov_len = batch_bytes;
+                batch_bytes = 0;
                 next_buf += iov.iov_len;
                 msg_count++;
                 auto& hdr = msg.msg_hdr;
@@ -621,7 +918,7 @@ namespace oxen::quic
                 hdr.msg_controllen = control.size();
 
                 auto* cm = CMSG_FIRSTHDR(&hdr);
-                size_t actual_size = set_ecn_cmsg(cm, ecn, source_ipv4);
+                size_t actual_size = set_ecn_cmsg(cm, ecn[i], source_ipv4);
 
                 if (set_source_addr)
                 {
@@ -647,6 +944,14 @@ namespace oxen::quic
 
             do
             {
+#ifndef NDEBUG
+                if (int err = take_debug_send_failure(this, true))
+                {
+                    rv = -1;
+                    errno = err;
+                    break;
+                }
+#endif
                 rv = sendmmsg(sock_, msgs.data(), msg_count, 0);
                 log::trace(log_cat, "sendmmsg returned {}", rv);
             } while (rv == -1 && errno == EINTR);
@@ -683,9 +988,19 @@ namespace oxen::quic
                         sent += gso_counts[i];
                     }
                 }
+                return {io_result{}, sent};
             }
 
-            return {io_result{rv < 0 ? errno : 0}, sent};
+            if (errno != EIO && errno != EINVAL)
+                return {io_result{errno}, sent};
+
+            // EIO means GSO can't work on this route (e.g. no checksum offload, before Linux 6.11,
+            // or an IPsec route).  EINVAL is either that or a batch larger than the path MTU, and
+            // resending without GSO tells them apart: the packets then fail one at a time with
+            // EMSGSIZE if it was the size.
+            gso_error = errno;
+            log::debug(log_cat, "UDP GSO send failed ({}); resending without GSO", std::strerror(gso_error));
+            next_buf = const_cast<char*>(reinterpret_cast<const char*>(buf));
         }
 #endif
 
@@ -717,7 +1032,7 @@ namespace oxen::quic
             hdr.msg_controllen = control.size();
 
             auto* cm = CMSG_FIRSTHDR(&hdr);
-            size_t actual_size = set_ecn_cmsg(cm, ecn, source_ipv4);
+            size_t actual_size = set_ecn_cmsg(cm, ecn[i], source_ipv4);
 
             if (set_source_addr)
             {
@@ -733,10 +1048,29 @@ namespace oxen::quic
 
         do
         {
+#ifndef NDEBUG
+            if (int err = take_debug_send_failure(this, false))
+            {
+                rv = -1;
+                errno = err;
+                break;
+            }
+#endif
             rv = sendmmsg(sock_, msgs.data(), n_pkts, MSG_DONTWAIT);
         } while (rv == -1 && errno == EINTR);
 
         sent = rv >= 0 ? rv : 0;
+
+#ifdef OXEN_LIBQUIC_UDP_GSO
+        // For EINVAL, GSO was the problem only if this resend went through.
+        if (gso_error == EIO || (gso_error == EINVAL && sent == n_pkts))
+        {
+            int send_errno = errno;
+            log::info(log_cat, "UDP GSO send failed ({}); disabling GSO on this socket", std::strerror(gso_error));
+            gso_ = false;
+            errno = send_errno;
+        }
+#endif
 
 #else  // No sendmmsg at all, so we just use sendmsg in a loop
 
@@ -764,27 +1098,28 @@ namespace oxen::quic
         hdr.msg_control = control.data();
         auto& hdr_msg_controllen = hdr.msg_controllen;
 #endif
-        hdr_msg_controllen = control.size();
-
-        auto* cm = CMSG_FIRSTHDR(&hdr);
-
-        size_t actual_size = set_ecn_cmsg(cm, ecn, remote.is_ipv4() || remote.is_ipv4_mapped_ipv6());
-
-        if (set_source_addr)
-        {
-            cm = CMSG_NXTHDR(&hdr, cm);
-            cm->cmsg_level = source_cmsg_level;
-            cm->cmsg_type = source_cmsg_type;
-            cm->cmsg_len = CMSG_LEN(source_addrlen);
-            std::memcpy(QUIC_CMSG_DATA(cm), &source_addr, source_addrlen);
-            actual_size += CMSG_SPACE(source_addrlen);
-        }
-
-        hdr_msg_controllen = actual_size;
+        const bool ecn_ipv4 = remote.is_ipv4() || remote.is_ipv4_mapped_ipv6();
 
         for (size_t i = 0; i < n_pkts; ++i)
         {
             assert(bufsize[i] > 0);
+
+            hdr_msg_controllen = control.size();
+            auto* cm = CMSG_FIRSTHDR(&hdr);
+
+            size_t actual_size = set_ecn_cmsg(cm, ecn[i], ecn_ipv4);
+
+            if (set_source_addr)
+            {
+                cm = CMSG_NXTHDR(&hdr, cm);
+                cm->cmsg_level = source_cmsg_level;
+                cm->cmsg_type = source_cmsg_type;
+                cm->cmsg_len = CMSG_LEN(source_addrlen);
+                std::memcpy(QUIC_CMSG_DATA(cm), &source_addr, source_addrlen);
+                actual_size += CMSG_SPACE(source_addrlen);
+            }
+
+            hdr_msg_controllen = actual_size;
 #ifdef _WIN32
             iov.buf = next_buf;
             iov.len = bufsize[i];

@@ -32,7 +32,9 @@ namespace oxen::quic
     using stream_close_callback = std::function<void(Stream&, uint64_t error_code)>;
     using stream_constructor_callback =
             std::function<std::shared_ptr<Stream>(Connection&, Endpoint&, std::optional<int64_t>)>;
-    // returns 0 on success
+    // Called when the remote opens a stream that wasn't queued with queue_incoming_stream (queuing
+    // is the alternative, for handling a stream in advance).  Returns 0 to accept the stream, or an
+    // application error code with which to close it.
     using stream_open_callback = std::function<uint64_t(Stream&)>;
     using stream_unblocked_callback = std::function<bool(Stream&)>;
 

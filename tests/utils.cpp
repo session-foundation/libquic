@@ -20,15 +20,17 @@
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
+#include <type_traits>
 
 namespace oxen::quic
 {
     void TestHelper::migrate_connection(Connection& conn, Address new_bind)
     {
         auto& current_sock = const_cast<std::unique_ptr<UDPSocket>&>(conn._endpoint.get_socket());
-        auto new_sock = std::make_unique<UDPSocket>(conn._loop.get_event_base(), new_bind, false, [&](auto&& packet) {
-            conn._endpoint.handle_packet(std::move(packet));
-        });
+        auto new_sock =
+                std::make_unique<UDPSocket>(conn._loop.get_event_base(), new_bind, UDPSocket::options{}, [&](auto&& packet) {
+                    conn._endpoint.handle_packet(std::move(packet));
+                });
 
         auto& new_addr = new_sock->address();
         Path new_path{new_addr, conn._path.remote};
@@ -44,9 +46,10 @@ namespace oxen::quic
     void TestHelper::migrate_connection_immediate(Connection& conn, Address new_bind)
     {
         auto& current_sock = const_cast<std::unique_ptr<UDPSocket>&>(conn._endpoint.get_socket());
-        auto new_sock = std::make_unique<UDPSocket>(conn._loop.get_event_base(), new_bind, false, [&](auto&& packet) {
-            conn._endpoint.handle_packet(std::move(packet));
-        });
+        auto new_sock =
+                std::make_unique<UDPSocket>(conn._loop.get_event_base(), new_bind, UDPSocket::options{}, [&](auto&& packet) {
+                    conn._endpoint.handle_packet(std::move(packet));
+                });
 
         auto& new_addr = new_sock->address();
         Path new_path{new_addr, conn._path.remote};
@@ -62,9 +65,10 @@ namespace oxen::quic
     void TestHelper::nat_rebinding(Connection& conn, Address new_bind)
     {
         auto& current_sock = const_cast<std::unique_ptr<UDPSocket>&>(conn._endpoint.get_socket());
-        auto new_sock = std::make_unique<UDPSocket>(conn._loop.get_event_base(), new_bind, false, [&](auto&& packet) {
-            conn._endpoint.handle_packet(std::move(packet));
-        });
+        auto new_sock =
+                std::make_unique<UDPSocket>(conn._loop.get_event_base(), new_bind, UDPSocket::options{}, [&](auto&& packet) {
+                    conn._endpoint.handle_packet(std::move(packet));
+                });
 
         auto& new_addr = new_sock->address();
         Path new_path{new_addr, conn._path.remote};
@@ -85,6 +89,105 @@ namespace oxen::quic
     UDPSocket::socket_t TestHelper::get_sock(Endpoint& ep)
     {
         return ep.get_socket()->sock_;
+    }
+
+    bool TestHelper::block_sends_for(Endpoint& ep, std::chrono::milliseconds duration)
+    {
+        return ep.job_queue.call_get([&] { return ep._debug_block_sends_for(duration); });
+    }
+
+    bool TestHelper::partial_sends(Endpoint& ep, size_t n_sends, size_t max_pkts, bool then_block)
+    {
+        return ep.job_queue.call_get([&] { return ep._debug_partial_sends(n_sends, max_pkts, then_block); });
+    }
+
+    bool TestHelper::simulate_mtu(Endpoint& ep, size_t mtu)
+    {
+        return ep.job_queue.call_get([&] { return ep._debug_mtu(mtu); });
+    }
+
+    bool TestHelper::fail_sends(Endpoint& ep, int err, size_t n_sends)
+    {
+        return ep.job_queue.call_get([&] { return ep._debug_fail_sends(err, n_sends); });
+    }
+
+    bool TestHelper::simulate_local_address(Endpoint& ep, std::optional<Address> addr)
+    {
+        return ep.job_queue.call_get(
+                [&] { return ep._debug_simulate_route_source(addr) && ep._debug_simulate_arrival_address(addr); });
+    }
+
+    bool TestHelper::simulate_arrival_address(Endpoint& ep, std::optional<Address> addr)
+    {
+        return ep.job_queue.call_get([&] { return ep._debug_simulate_arrival_address(std::move(addr)); });
+    }
+
+    bool TestHelper::switch_source_address(Endpoint& ep, std::optional<Address> addr)
+    {
+        return ep.job_queue.call_get(
+                [&] { return ep._debug_simulate_route_source(addr) && ep._debug_simulate_send_source(addr); });
+    }
+
+    Address TestHelper::ngtcp2_path_remote(Connection& conn)
+    {
+        return conn._endpoint.job_queue.call_get([&] { return Address{ngtcp2_conn_get_path(conn)->remote}; });
+    }
+
+    size_t TestHelper::route_lookups(Endpoint& ep)
+    {
+        return ep.job_queue.call_get([&] { return ep._debug_route_lookups(); });
+    }
+
+    bool TestHelper::block_migrations(Endpoint& ep, size_t n)
+    {
+        return ep.job_queue.call_get([&] { return ep._debug_block_migrations(n); });
+    }
+
+    Address TestHelper::ngtcp2_path_local(Connection& conn)
+    {
+        return conn._endpoint.job_queue.call_get([&] { return Address{ngtcp2_conn_get_path(conn)->local}; });
+    }
+
+    bool TestHelper::fail_socket_sends(Endpoint& ep, std::vector<int> gso_errors, std::vector<int> plain_errors)
+    {
+        return ep.job_queue.call_get(
+                [&] { return ep.get_socket()->_debug_fail_sends(std::move(gso_errors), std::move(plain_errors)); });
+    }
+
+    bool TestHelper::gso_enabled(Endpoint& ep)
+    {
+        return ep.job_queue.call_get([&] { return ep.get_socket()->gso_; });
+    }
+
+    bool TestHelper::gro_enabled(Endpoint& ep)
+    {
+        return ep.job_queue.call_get([&] { return ep.get_socket()->gro_; });
+    }
+
+    std::optional<size_t> TestHelper::gro_merges(Endpoint& ep)
+    {
+        return ep.job_queue.call_get([&] { return ep.get_socket()->_debug_gro_merges(); });
+    }
+
+    size_t TestHelper::path_max_udp_payload(Connection& conn)
+    {
+        return conn._endpoint.job_queue.call_get([&] { return ngtcp2_conn_get_path_max_tx_udp_payload_size(conn); });
+    }
+
+    io_result TestHelper::send_packets(
+            Endpoint& ep, const Path& path, std::byte* buf, size_t* bufsize, uint8_t* ecn, size_t& n_pkts)
+    {
+        return ep.job_queue.call_get([&] { return ep.send_packets(path, buf, bufsize, ecn, n_pkts, false); });
+    }
+
+    Endpoint::debug_send_stats TestHelper::send_stats(Endpoint& ep)
+    {
+        return ep.job_queue.call_get([&] { return ep._debug_send_stats(); });
+    }
+
+    void TestHelper::mark_dead(Connection& conn)
+    {
+        conn._endpoint.job_queue.call_get([&] { conn.dead = true; });
     }
 
     void TestHelper::drop_connection_now(Endpoint& ep, Connection& conn, uint64_t ec)
@@ -169,6 +272,20 @@ namespace oxen::quic
         return std::make_pair(std::move(client), std::move(server));
     }
 
+    // nettle 4.0 dropped the length argument from the *_digest functions, which now always write the
+    // full digest.  We build against both a distro nettle 3 and session-deps' nettle 4, so dispatch on
+    // whichever signature the nettle in use declares rather than on a version macro.  The call site
+    // asks for the full digest length, which is what nettle 3 needs and what nettle 4 assumes, so the
+    // two spellings compute the same thing.
+    template <auto digest, typename Ctx, typename Out>
+    static void nettle_digest(Ctx* ctx, size_t length, Out* out)
+    {
+        if constexpr (std::is_invocable_v<decltype(digest), Ctx*, size_t, Out*>)
+            digest(ctx, length, out);
+        else
+            digest(ctx, out);
+    }
+
     void sha3_256(uint8_t* out, std::span<const uint8_t> value, std::string_view domain)
     {
         sha3_256_ctx ctx;
@@ -177,25 +294,11 @@ namespace oxen::quic
             sha3_256_update(&ctx, domain.size(), reinterpret_cast<const uint8_t*>(domain.data()));
 
         sha3_256_update(&ctx, value.size(), value.data());
-        sha3_256_digest(&ctx, 32, out);
+        nettle_digest<sha3_256_digest>(&ctx, SHA3_256_DIGEST_SIZE, out);
     }
     void sha3_256(uint8_t* out, std::span<const char> value, std::string_view domain)
     {
         return sha3_256(out, {reinterpret_cast<const uint8_t*>(value.data()), value.size()}, domain);
-    }
-    void sha3_512(uint8_t* out, std::span<const uint8_t> value, std::string_view domain)
-    {
-        sha3_512_ctx ctx;
-        sha3_512_init(&ctx);
-        if (!domain.empty())
-            sha3_512_update(&ctx, domain.size(), reinterpret_cast<const uint8_t*>(domain.data()));
-
-        sha3_512_update(&ctx, value.size(), value.data());
-        sha3_512_digest(&ctx, 32, out);
-    }
-    void sha3_512(uint8_t* out, std::span<const char> value, std::string_view domain)
-    {
-        return sha3_512(out, {reinterpret_cast<const uint8_t*>(value.data()), value.size()}, domain);
     }
 
     std::pair<std::string, std::string> generate_ed25519(std::string_view seed_string)
@@ -590,7 +693,7 @@ namespace oxen::quic
         ep = ep_;
 
         sock = std::make_unique<UDPSocket>(
-                ep_->loop.get_event_base(), ep_->local(), false, [wself = weak_from_this()](Packet&& pkt) {
+                ep_->loop.get_event_base(), ep_->local(), UDPSocket::options{}, [wself = weak_from_this()](Packet&& pkt) {
                     log::debug(log_cat, "incoming {}B udp packet from {}; delaying delivery", pkt.size(), pkt.path);
                     auto sself = wself.lock();
                     if (!sself)
@@ -659,7 +762,8 @@ namespace oxen::quic
                         break;
                     log::debug(log_cat, "completing outgoing delayed delivery of {}B packet along {}", data.size(), path);
                     size_t sz = data.size();
-                    auto [res, sent] = self.sock->send(path, data.data(), &sz, 0, 1);
+                    uint8_t ecn = 0;
+                    auto [res, sent] = self.sock->send(path, data.data(), &sz, &ecn, 1, true);
                     if (sent != 1)
                         log::critical(
                                 log_cat,

@@ -2,7 +2,12 @@
 
 #include "address.hpp"
 
+#include <algorithm>
+#include <cstdint>
+#include <span>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace oxen::quic
 {
@@ -13,24 +18,59 @@ namespace oxen::quic
     {
         using namespace std::chrono_literals;
 
-        // Caps the maximum QUIC packet size (i.e. the UDP payload) that path MTU discovery will
-        // probe up to.  PMTUD still runs normally, probing upward from the 1200-byte QUIC
-        // minimum, but will never exceed this value.  Setting this to 1200 effectively disables
-        // PMTUD since there is nowhere to probe.
+        // Controls the QUIC packet sizes (i.e. UDP payload sizes) that path MTU discovery probes,
+        // and so the largest packets a connection sends and accepts.  Connections start at the
+        // 1200-byte QUIC minimum and probe upward through the list.
         //
-        // The value is the maximum UDP payload size, NOT the link-layer MTU.  Use the ipv4()
-        // or ipv6() factories to convert from a link MTU.  Must be at least 1200.
-        struct max_udp_payload
+        // Given a single size, the default probe list (DEFAULT_PMTUD_PROBES) is used, limited to
+        // the sizes no larger than the given one; a size below all of them (e.g. minimum())
+        // disables PMTUD.  Given a span, that list is used instead: each size must be larger than
+        // 1200 and at most MAX_PMTUD_UDP_PAYLOAD, and they are probed in the given order, skipping
+        // any size no larger than one already confirmed or no smaller than one that failed.  To
+        // probe exactly one size, pass a span of just that size.
+        //
+        // Either way, IPv6 connections skip sizes larger than MAX_IPV6_UDP_PAYLOAD (1452), the most
+        // a 1500-byte MTU carries over IPv6.
+        //
+        // The values are UDP payload sizes, NOT link-layer MTUs.  Use the ipv4() or ipv6()
+        // factories to convert from a link MTU.
+        class max_udp_payload
         {
-            size_t size;
-            explicit max_udp_payload(size_t s) : size{s}
+            std::vector<uint16_t> _probes;
+
+          public:
+            explicit max_udp_payload(size_t max)
             {
-                if (s < 1200)
+                if (max < MIN_UDP_PAYLOAD)
                     throw std::invalid_argument{"max_udp_payload size must be at least 1200"};
+                for (auto size : DEFAULT_PMTUD_PROBES)
+                    if (size <= max)
+                        _probes.push_back(size);
             }
 
-            // The QUIC minimum (1200); effectively disables PMTUD.
-            static max_udp_payload minimum() { return max_udp_payload{1200}; }
+            explicit max_udp_payload(std::span<const uint16_t> probes) : _probes{probes.begin(), probes.end()}
+            {
+                for (auto size : _probes)
+                    if (size <= MIN_UDP_PAYLOAD || size > MAX_PMTUD_UDP_PAYLOAD)
+                        throw std::invalid_argument{
+                                "max_udp_payload probe sizes must be larger than 1200 and at most " +
+                                std::to_string(MAX_PMTUD_UDP_PAYLOAD)};
+            }
+
+            // The sizes to probe, in order; empty when PMTUD is disabled.
+            std::span<const uint16_t> probes() const { return _probes; }
+
+            // The largest size in the probe list, or 1200 if it is empty.
+            size_t max() const
+            {
+                size_t m = MIN_UDP_PAYLOAD;
+                for (auto size : _probes)
+                    m = std::max<size_t>(m, size);
+                return m;
+            }
+
+            // The QUIC minimum (1200): disables PMTUD.
+            static max_udp_payload minimum() { return max_udp_payload{MIN_UDP_PAYLOAD}; }
 
             // Constructs from an IPv4 link MTU by subtracting 28 bytes (20 IP + 8 UDP).
             static max_udp_payload ipv4(size_t link_mtu) { return max_udp_payload{link_mtu - 28}; }
@@ -52,6 +92,15 @@ namespace oxen::quic
         // On systems without GSO support (or with GSO disabled at compile time) this option is
         // ignored.
         struct allow_gso
+        {};
+
+        // Allow UDP GRO to be used when receiving (Linux 5.0+), where the kernel merges consecutive
+        // packets from the same sender into one buffer, so that a single receive can return many
+        // packets.  It takes larger receive buffers (512kB per endpoint rather than about 94kB), and
+        // is disabled by default.
+        //
+        // Ignored where the OS doesn't support it, or libquic was built without recvmmsg.
+        struct allow_gro
         {};
 
         struct max_streams
@@ -148,9 +197,8 @@ namespace oxen::quic
         /// The max size of a transmittable datagram can be queried directly from
         /// Connection::get_max_datagram_size(). At connection initialization, ngtcp2 will default
         /// this value to 1200.  The actual value is negotiated upwards via path discovery, reaching
-        /// a theoretical maximum of NGTCP2_MAX_PMTUD_UDP_PAYLOAD_SIZE (1452), or near it, per
-        /// datagram. Please note that enabling datagram splitting will double whatever value is
-        /// returned.
+        /// at most MAX_PMTUD_UDP_PAYLOAD (1472), or near it, per datagram. Please note that
+        /// enabling datagram splitting will double whatever value is returned.
         ///
         /// Note: this setting CANNOT be changed for an endpoint after creation, it must be
         /// destroyed and re-initialized with the desired settings.
