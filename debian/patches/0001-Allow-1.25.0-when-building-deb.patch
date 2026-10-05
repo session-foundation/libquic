@@ -1,0 +1,24 @@
+From: Jason Rhinelander <jason@imaginary.ca>
+Date: Mon, 5 Oct 2026 18:54:33 -0300
+Subject: Allow 1.25.0 when building deb
+
+We ship a 1.25.0+stf backport with the needed patch applied, so it is
+fine and we can drop the stock package's 1.26.0 requirement.  (This is
+coupled with a >= 1.25.0+stf requirement in debian/control).
+---
+ src/CMakeLists.txt | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 4d12419..805015a 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -5,7 +5,7 @@ configure_file(version.cpp.in version.cpp @ONLY)
+ # 1.26.0 stops a server keeping a path's max UDP payload size when the client's IP address changes,
+ # which stalls the connection when the new path's MTU is smaller.  session-deps' 1.25.0 carries that
+ # fix as a patch.
+-session_dep(libngtcp2 1.26.0 WITH libngtcp2_crypto_gnutls)
++session_dep(libngtcp2 1.25.0 WITH libngtcp2_crypto_gnutls)
+ session_dep(gnutls 3.7.2)
+ session_dep(nettle 3.5)
+ session_dep(libevent_core 2.1 WITH libevent_pthreads)
