@@ -522,7 +522,9 @@ namespace oxen::quic::test
 
         RemoteAddress client_remote{defaults::SERVER_PUBKEY, LOCALHOST, server_endpoint->local().port()};
 
-        auto client = test_net.endpoint(client_local, split_dgram, client_established);
+        // The packing arithmetic below is exact for a 1444-byte path, so PMTUD probes only that.
+        const std::array<uint16_t, 1> probe_1444{1444};
+        auto client = test_net.endpoint(client_local, split_dgram, client_established, opt::max_udp_payload{probe_1444});
         auto conn_interface = client->connect(client_remote, client_tls);
 
         REQUIRE(client_established.wait());

@@ -1,6 +1,14 @@
+// macOS only declares IPV6_DONTFRAG (checked by the don't-fragment test, and set by udp.cpp) when
+// this is defined before any system header is included.
+#ifdef __APPLE__
+#define __APPLE_USE_RFC_3542
+#endif
+
 #include "unit_test.hpp"
 
 #include <atomic>
+#include <map>
+#include <mutex>
 
 namespace oxen::quic::test
 {
@@ -972,5 +980,871 @@ namespace oxen::quic::test
         std::this_thread::sleep_for(250ms);
 
         CHECK(resp.calls == 1);
+    }
+
+    TEST_CASE("002 - Each packet in a batch is sent with its own ECN marking", "[002][ecn]")
+    {
+        // Equal-sized packets, so that only the differing ECN values can keep GSO from sending
+        // them all as a single batch (or GRO from merging them).
+        const bool allow_gso = GENERATE(false, true);
+        const bool allow_gro = GENERATE(false, true);
+        const auto localhost = GENERATE("127.0.0.1"s, "::1"s);
+        constexpr std::array<uint8_t, 6> ecns{0, 2, 2, 0, 1, 3};
+
+        Loop loop;
+        std::vector<std::pair<int, uint8_t>> received;  // (packet index, ecn); loop thread only
+        std::promise<void> all_received;
+        std::unique_ptr<UDPSocket> sender, receiver;
+
+        loop.call_get([&] {
+            receiver = std::make_unique<UDPSocket>(
+                    loop.get_event_base(),
+                    Address{localhost, 0},
+                    UDPSocket::options{.allow_gro = allow_gro},
+                    [&](Packet&& pkt) {
+                        received.emplace_back(static_cast<int>(pkt.data()[0]), pkt.pkt_info.ecn);
+                        if (received.size() == ecns.size())
+                            all_received.set_value();
+                    });
+            sender = std::make_unique<UDPSocket>(
+                    loop.get_event_base(), Address{localhost, 0}, UDPSocket::options{.allow_gso = allow_gso}, [](Packet&&) {
+                    });
+
+            std::array<std::byte, 100 * ecns.size()> bufs;
+            std::array<size_t, ecns.size()> sizes;
+            for (size_t i = 0; i < ecns.size(); i++)
+            {
+                std::fill_n(bufs.begin() + 100 * i, 100, static_cast<std::byte>(i));
+                sizes[i] = 100;
+            }
+            auto [res, sent] = sender->send(
+                    Path{sender->address(), receiver->address()},
+                    bufs.data(),
+                    sizes.data(),
+                    ecns.data(),
+                    ecns.size(),
+                    false);
+            REQUIRE(res.success());
+            REQUIRE(sent == ecns.size());
+        });
+
+        require_future(all_received.get_future());
+
+        loop.call_get([&] {
+            for (size_t i = 0; i < received.size(); i++)
+            {
+                CHECK(received[i].first == static_cast<int>(i));
+                CHECK(received[i].second == ecns[i]);
+            }
+            sender.reset();
+            receiver.reset();
+        });
+    }
+
+    TEST_CASE("002 - Batched packets of mixed sizes arrive intact", "[002][gso]")
+    {
+        // Covers each GSO batching decision: full-size runs ending in one shorter packet (after two
+        // or more full ones), a shorter packet that may not join a single full one, and a larger
+        // packet followed by a smaller one (as with a PMTUD probe), which must not form a batch.
+        // On loopback a GRO socket receives each GSO batch as one merged buffer, which then has to
+        // be split back into the same packets.
+        const bool allow_gso = GENERATE(false, true);
+        const bool allow_gro = GENERATE(false, true);
+        constexpr std::array<size_t, 12> sizes{1000, 1000, 600, 1000, 1000, 1000, 500, 1000, 700, 1400, 600, 800};
+
+        Loop loop;
+        struct received_pkt
+        {
+            int index;
+            size_t size;
+            bool intact;
+        };
+        std::vector<received_pkt> received;  // loop thread only
+        std::promise<void> all_received;
+        std::unique_ptr<UDPSocket> sender, receiver;
+
+        loop.call_get([&] {
+            receiver = std::make_unique<UDPSocket>(
+                    loop.get_event_base(),
+                    Address{"127.0.0.1", 0},
+                    UDPSocket::options{.allow_gro = allow_gro},
+                    [&](Packet&& pkt) {
+                        auto d = pkt.data();
+                        bool intact = std::all_of(d.begin(), d.end(), [&](std::byte b) { return b == d[0]; });
+                        received.push_back({static_cast<int>(d[0]), d.size(), intact});
+                        if (received.size() == sizes.size())
+                            all_received.set_value();
+                    });
+            sender = std::make_unique<UDPSocket>(
+                    loop.get_event_base(),
+                    Address{"127.0.0.1", 0},
+                    UDPSocket::options{.allow_gso = allow_gso},
+                    [](Packet&&) {});
+
+            std::vector<std::byte> buf;
+            for (size_t i = 0; i < sizes.size(); i++)
+                buf.insert(buf.end(), sizes[i], static_cast<std::byte>(i));
+            std::array<uint8_t, sizes.size()> ecns{};
+            auto [res, sent] = sender->send(
+                    Path{sender->address(), receiver->address()},
+                    buf.data(),
+                    sizes.data(),
+                    ecns.data(),
+                    sizes.size(),
+                    false);
+            REQUIRE(res.success());
+            REQUIRE(sent == sizes.size());
+        });
+
+        require_future(all_received.get_future());
+
+        loop.call_get([&] {
+            for (size_t i = 0; i < received.size(); i++)
+            {
+                CHECK(received[i].index == static_cast<int>(i));
+                CHECK(received[i].size == sizes[i]);
+                CHECK(received[i].intact);
+            }
+            if (TestHelper::gso_enabled(*sender) && TestHelper::gro_enabled(*receiver))
+                if (auto merges = TestHelper::gro_merges(*receiver))
+                    CHECK(*merges > 0);
+            sender.reset();
+            receiver.reset();
+        });
+    }
+
+    TEST_CASE("002 - A blocked socket stalls the endpoint's sends until it clears", "[002][stall]")
+    {
+        Network test_net{};
+
+        constexpr int n_conns = 3;
+        std::vector<std::byte> msg(100'000);
+        for (size_t i = 0; i < msg.size(); i++)
+            msg[i] = static_cast<std::byte>(i % 251);
+
+        std::mutex received_mut;
+        std::map<Stream*, std::vector<std::byte>> received;
+        int complete = 0;
+        std::promise<void> all_received;
+        stream_data_callback server_data_cb = [&](Stream& s, std::span<const std::byte> dat) {
+            std::lock_guard lock{received_mut};
+            auto& r = received[&s];
+            r.insert(r.end(), dat.begin(), dat.end());
+            if (r.size() == msg.size() && ++complete == n_conns)
+                all_received.set_value();
+        };
+
+        std::atomic<int> established{0};
+        std::promise<void> all_established;
+        connection_established_callback client_established = [&](Connection&) {
+            if (++established == n_conns)
+                all_established.set_value();
+        };
+
+        auto [client_tls, server_tls] = defaults::tls_creds_from_ed_keys();
+
+        auto server_endpoint = test_net.endpoint(Address{});
+        REQUIRE_NOTHROW(server_endpoint->listen(server_tls, server_data_cb));
+        RemoteAddress server_remote{defaults::SERVER_PUBKEY, LOCALHOST, server_endpoint->local().port()};
+
+        // All of the connections share one client endpoint, and so one send batch.
+        auto client_endpoint = test_net.endpoint(Address{}, client_established);
+        std::vector<std::shared_ptr<Connection>> conns;
+        for (int i = 0; i < n_conns; i++)
+            conns.push_back(client_endpoint->connect(server_remote, client_tls));
+        require_future(all_established.get_future());
+
+        if (!TestHelper::block_sends_for(*client_endpoint, 250ms))
+            SKIP("Send stall testing requires a debug build of libquic");
+
+        std::vector<std::shared_ptr<Stream>> streams;
+        for (auto& c : conns)
+        {
+            streams.push_back(c->open_stream());
+            streams.back()->send(msg, nullptr);
+        }
+
+        require_future(all_received.get_future(), 5s);
+        {
+            std::lock_guard lock{received_mut};
+            for (auto& [s, r] : received)
+                CHECK(r == msg);
+        }
+
+        auto stats = TestHelper::send_stats(*client_endpoint);
+        CHECK(stats.stalls >= 1);
+        // A waiting connection only retries its flush when something new wakes it (incoming
+        // packets, new data to send, an already-armed timer); anything that kept re-waking waiters
+        // during the stall would instead show up here as a skip on every loop iteration, which over
+        // the 250ms stall is thousands of times.
+        CHECK(stats.skips < 50);
+        CHECK(stats.discards == 0);
+    }
+
+    TEST_CASE("002 - A stalled batch is discarded if its connection goes away", "[002][stall]")
+    {
+        Network test_net{};
+
+        std::vector<std::byte> msg(10'000);
+        for (size_t i = 0; i < msg.size(); i++)
+            msg[i] = static_cast<std::byte>(i % 251);
+
+        std::mutex received_mut;
+        std::map<Stream*, std::vector<std::byte>> received;
+        std::promise<void> one_received;
+        stream_data_callback server_data_cb = [&](Stream& s, std::span<const std::byte> dat) {
+            std::lock_guard lock{received_mut};
+            auto& r = received[&s];
+            r.insert(r.end(), dat.begin(), dat.end());
+            if (r.size() == msg.size())
+                one_received.set_value();
+        };
+
+        std::atomic<int> established{0};
+        std::promise<void> both_established;
+        connection_established_callback client_established = [&](Connection&) {
+            if (++established == 2)
+                both_established.set_value();
+        };
+
+        auto [client_tls, server_tls] = defaults::tls_creds_from_ed_keys();
+
+        auto server_endpoint = test_net.endpoint(Address{});
+        REQUIRE_NOTHROW(server_endpoint->listen(server_tls, server_data_cb));
+        RemoteAddress server_remote{defaults::SERVER_PUBKEY, LOCALHOST, server_endpoint->local().port()};
+
+        auto client_endpoint = test_net.endpoint(Address{}, client_established);
+        auto conn_a = client_endpoint->connect(server_remote, client_tls);
+        auto conn_b = client_endpoint->connect(server_remote, client_tls);
+        require_future(both_established.get_future());
+
+        if (!TestHelper::block_sends_for(*client_endpoint, 300ms))
+            SKIP("Send stall testing requires a debug build of libquic");
+
+        // A's first send blocks, so A's packets (all it ever gets to send) are the stalled batch.
+        auto stream_a = conn_a->open_stream();
+        stream_a->send(msg, nullptr);
+        REQUIRE(wait_for([&] { return TestHelper::send_stats(*client_endpoint).stalls == 1; }, 200ms, 1ms));
+
+        auto stream_b = conn_b->open_stream();
+        stream_b->send(msg, nullptr);
+        REQUIRE(wait_for([&] { return TestHelper::send_stats(*client_endpoint).skips >= 1; }, 200ms, 1ms));
+
+        SECTION("owner closed during the stall")
+        {
+            conn_a->close_connection();
+            REQUIRE(wait_for(
+                    [&] { return client_endpoint->job_queue.call_get([&] { return conn_a->is_closing(); }); }, 200ms, 1ms));
+        }
+        SECTION("owner died during the stall")
+        {
+            TestHelper::mark_dead(*conn_a);
+        }
+
+        // B was waiting on the stall, so it gets woken (and sends) once the socket unblocks.
+        require_future(one_received.get_future(), 5s);
+        std::this_thread::sleep_for(100ms);
+
+        CHECK(TestHelper::send_stats(*client_endpoint).discards == 1);
+        {
+            std::lock_guard lock{received_mut};
+            REQUIRE(received.size() == 1);
+            CHECK(received.begin()->second == msg);
+        }
+
+        conn_a->close_connection();
+    }
+
+    TEST_CASE("002 - A partly sent batch keeps its unsent packets intact", "[002][stall][partial]")
+    {
+        // Different sizes so that the unsent packets have to be moved by the right byte offset.
+        constexpr std::array<size_t, 6> sizes{100, 200, 150, 300, 120, 80};
+        constexpr std::array<uint8_t, 6> ecns{0, 2, 2, 0, 1, 3};
+
+        // Whether the socket is then full (the rest must be kept for later), or the short count was
+        // sendmmsg dropping an error and an immediate retry gets the rest away.
+        const bool then_block = GENERATE(true, false);
+
+        Network test_net{};
+        auto ep = test_net.endpoint(Address{LOCALHOST, 0});
+
+        if (!TestHelper::partial_sends(*ep, 1, 2, then_block))
+            SKIP("Partial send testing requires a debug build of libquic with batched sends");
+
+        struct received_pkt
+        {
+            int index;
+            size_t size;
+            uint8_t ecn;
+            bool intact;
+        };
+        std::vector<received_pkt> received;  // loop thread only
+        std::promise<void> all_received;
+        std::unique_ptr<UDPSocket> receiver;
+        test_net.loop()->call_get([&] {
+            receiver = std::make_unique<UDPSocket>(
+                    test_net.loop()->get_event_base(), Address{LOCALHOST, 0}, UDPSocket::options{}, [&](Packet&& pkt) {
+                        auto d = pkt.data();
+                        auto index = static_cast<int>(d[0]);
+                        bool intact = std::all_of(d.begin(), d.end(), [&](std::byte b) { return b == d[0]; });
+                        received.push_back({index, d.size(), pkt.pkt_info.ecn, intact});
+                        if (received.size() == sizes.size())
+                            all_received.set_value();
+                    });
+        });
+
+        std::vector<std::byte> buf;
+        std::array<size_t, 6> bufsize = sizes;
+        std::array<uint8_t, 6> ecn = ecns;
+        for (size_t i = 0; i < sizes.size(); i++)
+            buf.insert(buf.end(), sizes[i], static_cast<std::byte>(i));
+
+        Path path{ep->local(), test_net.loop()->call_get([&] { return receiver->address(); })};
+        size_t n = sizes.size();
+
+        auto res = TestHelper::send_packets(*ep, path, buf.data(), bufsize.data(), ecn.data(), n);
+        if (then_block)
+        {
+            CHECK(res.blocked());
+            REQUIRE(n == 4);
+            for (size_t i = 0; i < n; i++)
+            {
+                CHECK(bufsize[i] == sizes[i + 2]);
+                CHECK(ecn[i] == ecns[i + 2]);
+            }
+            CHECK(buf[0] == std::byte{2});
+            CHECK(buf[sizes[2]] == std::byte{3});
+
+            res = TestHelper::send_packets(*ep, path, buf.data(), bufsize.data(), ecn.data(), n);
+        }
+        CHECK(res.success());
+        CHECK(n == 0);
+
+        require_future(all_received.get_future());
+        test_net.loop()->call_get([&] {
+            for (size_t i = 0; i < received.size(); i++)
+            {
+                CHECK(received[i].index == static_cast<int>(i));
+                CHECK(received[i].size == sizes[i]);
+                CHECK(received[i].ecn == ecns[i]);
+                CHECK(received[i].intact);
+            }
+            receiver.reset();
+        });
+    }
+
+    TEST_CASE("002 - Streams survive repeatedly partly sent batches", "[002][stall][partial]")
+    {
+        Network test_net{};
+
+        constexpr int n_conns = 2;
+        std::vector<std::byte> msg(100'000);
+        for (size_t i = 0; i < msg.size(); i++)
+            msg[i] = static_cast<std::byte>(i % 251);
+
+        std::mutex received_mut;
+        std::map<Stream*, std::vector<std::byte>> received;
+        int complete = 0;
+        std::promise<void> all_received;
+        stream_data_callback server_data_cb = [&](Stream& s, std::span<const std::byte> dat) {
+            std::lock_guard lock{received_mut};
+            auto& r = received[&s];
+            r.insert(r.end(), dat.begin(), dat.end());
+            if (r.size() == msg.size() && ++complete == n_conns)
+                all_received.set_value();
+        };
+
+        std::atomic<int> established{0};
+        std::promise<void> all_established;
+        connection_established_callback client_established = [&](Connection&) {
+            if (++established == n_conns)
+                all_established.set_value();
+        };
+
+        auto [client_tls, server_tls] = defaults::tls_creds_from_ed_keys();
+
+        auto server_endpoint = test_net.endpoint(Address{});
+        REQUIRE_NOTHROW(server_endpoint->listen(server_tls, server_data_cb));
+        RemoteAddress server_remote{defaults::SERVER_PUBKEY, LOCALHOST, server_endpoint->local().port()};
+
+        auto client_endpoint = test_net.endpoint(Address{}, client_established);
+        std::vector<std::shared_ptr<Connection>> conns;
+        for (int i = 0; i < n_conns; i++)
+            conns.push_back(client_endpoint->connect(server_remote, client_tls));
+        require_future(all_established.get_future());
+
+        if (!TestHelper::partial_sends(*client_endpoint, 30, 5))
+            SKIP("Partial send testing requires a debug build of libquic with batched sends");
+
+        std::vector<std::shared_ptr<Stream>> streams;
+        for (auto& c : conns)
+        {
+            streams.push_back(c->open_stream());
+            streams.back()->send(msg, nullptr);
+        }
+
+        require_future(all_received.get_future(), 5s);
+        {
+            std::lock_guard lock{received_mut};
+            for (auto& [s, r] : received)
+                CHECK(r == msg);
+        }
+
+        auto stats = TestHelper::send_stats(*client_endpoint);
+        CHECK(stats.stalls >= 1);
+        CHECK(stats.discards == 0);
+    }
+
+    TEST_CASE("002 - Send errors that only lose packets don't close the connection", "[002][senderr]")
+    {
+        // "too big": with a 1300-byte MTU, ngtcp2's PMTUD probes above that fail with EMSGSIZE.
+        // "no buffers": a few sends fail with ENOBUFS while the stream is being sent.
+        const auto mode = GENERATE(as<std::string>{}, "too big", "no buffers");
+
+        Network test_net{};
+
+        std::vector<std::byte> msg(100'000);
+        for (size_t i = 0; i < msg.size(); i++)
+            msg[i] = static_cast<std::byte>(i % 251);
+
+        std::mutex received_mut;
+        std::vector<std::byte> received;
+        std::promise<void> all_received;
+        stream_data_callback server_data_cb = [&](Stream&, std::span<const std::byte> dat) {
+            std::lock_guard lock{received_mut};
+            received.insert(received.end(), dat.begin(), dat.end());
+            if (received.size() == msg.size())
+                all_received.set_value();
+        };
+
+        auto client_established = callback_waiter{[](Connection&) {}};
+        std::atomic<bool> client_closed{false};
+        connection_closed_callback client_closed_cb = [&](Connection&, uint64_t) { client_closed = true; };
+
+        auto [client_tls, server_tls] = defaults::tls_creds_from_ed_keys();
+
+        auto server_endpoint = test_net.endpoint(Address{});
+        REQUIRE_NOTHROW(server_endpoint->listen(server_tls, server_data_cb));
+        RemoteAddress server_remote{defaults::SERVER_PUBKEY, LOCALHOST, server_endpoint->local().port()};
+
+        auto client_endpoint = test_net.endpoint(Address{}, client_established, client_closed_cb);
+
+        if (mode == "too big" && !TestHelper::simulate_mtu(*client_endpoint, 1300))
+            SKIP("Send error testing requires a debug build of libquic");
+
+        auto conn = client_endpoint->connect(server_remote, client_tls);
+        REQUIRE(client_established.wait());
+
+        if (mode == "no buffers" && !TestHelper::fail_sends(*client_endpoint, ENOBUFS, 5))
+            SKIP("Send error testing requires a debug build of libquic");
+
+        auto stream = conn->open_stream();
+        stream->send(msg, nullptr);
+
+        require_future(all_received.get_future(), 5s);
+        {
+            std::lock_guard lock{received_mut};
+            CHECK(received == msg);
+        }
+
+        auto stats = TestHelper::send_stats(*client_endpoint);
+        if (mode == "too big")
+            CHECK(stats.too_big_drops > 0);
+        else
+            CHECK(stats.no_buffer_drops > 0);
+        CHECK_FALSE(client_closed);
+        CHECK_FALSE(client_endpoint->job_queue.call_get([&] { return conn->is_closing() || conn->is_draining(); }));
+    }
+
+    TEST_CASE("002 - Other send errors still close the connection", "[002][senderr]")
+    {
+        Network test_net{};
+
+        auto client_established = callback_waiter{[](Connection&) {}};
+        auto client_closed = callback_waiter{[](Connection&, uint64_t) {}};
+
+        auto [client_tls, server_tls] = defaults::tls_creds_from_ed_keys();
+
+        auto server_endpoint = test_net.endpoint(Address{});
+        REQUIRE_NOTHROW(server_endpoint->listen(server_tls));
+        RemoteAddress server_remote{defaults::SERVER_PUBKEY, LOCALHOST, server_endpoint->local().port()};
+
+        auto client_endpoint = test_net.endpoint(Address{}, client_established, client_closed);
+        auto conn = client_endpoint->connect(server_remote, client_tls);
+        REQUIRE(client_established.wait());
+
+        if (!TestHelper::fail_sends(*client_endpoint, EPERM, 1))
+            SKIP("Send error testing requires a debug build of libquic");
+
+        auto stream = conn->open_stream();
+        stream->send("hello"s);
+
+        CHECK(client_closed.wait());
+    }
+
+    TEST_CASE("002 - A failed GSO send falls back to sending without it", "[002][senderr][gso]")
+    {
+        // "EIO": GSO can't work on the route, so it gets disabled.
+        // "EINVAL, unsupported": the resend without GSO works, so GSO was the problem: disabled.
+        // "EINVAL, too big": the resend without GSO fails with EMSGSIZE, so it was the size: GSO
+        //   stays on, and since the refused packets are within the path's confirmed size the
+        //   connection closes.
+        const auto mode = GENERATE(as<std::string>{}, "EIO", "EINVAL, unsupported", "EINVAL, too big");
+
+        std::promise<uint64_t> client_closed;
+        std::atomic<bool> closed_once{false};
+        connection_closed_callback on_client_closed = [&](Connection&, uint64_t ec) {
+            if (!closed_once.exchange(true))
+                client_closed.set_value(ec);
+        };
+
+        Network test_net{};
+
+        std::vector<std::byte> msg(100'000);
+        for (size_t i = 0; i < msg.size(); i++)
+            msg[i] = static_cast<std::byte>(i % 251);
+
+        std::mutex received_mut;
+        std::vector<std::byte> received;
+        std::promise<void> all_received;
+        stream_data_callback server_data_cb = [&](Stream&, std::span<const std::byte> dat) {
+            std::lock_guard lock{received_mut};
+            received.insert(received.end(), dat.begin(), dat.end());
+            if (received.size() == msg.size())
+                all_received.set_value();
+        };
+
+        auto client_established = callback_waiter{[](Connection&) {}};
+        auto [client_tls, server_tls] = defaults::tls_creds_from_ed_keys();
+
+        auto server_endpoint = test_net.endpoint(Address{});
+        REQUIRE_NOTHROW(server_endpoint->listen(server_tls, server_data_cb));
+        RemoteAddress server_remote{defaults::SERVER_PUBKEY, LOCALHOST, server_endpoint->local().port()};
+
+        auto client_endpoint = test_net.endpoint(Address{}, client_established, on_client_closed, opt::allow_gso{});
+        auto conn = client_endpoint->connect(server_remote, client_tls);
+        REQUIRE(client_established.wait());
+        if (!TestHelper::gso_enabled(*client_endpoint))
+            SKIP("This build of libquic does not support GSO");
+
+        bool injected = mode == "EIO" ? TestHelper::fail_socket_sends(*client_endpoint, {EIO}, {})
+                      : mode == "EINVAL, unsupported"
+                              ? TestHelper::fail_socket_sends(*client_endpoint, {EINVAL}, {})
+                              : TestHelper::fail_socket_sends(*client_endpoint, {EINVAL}, {EMSGSIZE});
+        if (!injected)
+            SKIP("Send error testing requires a debug build of libquic");
+
+        auto stream = conn->open_stream();
+        stream->send(msg, nullptr);
+
+        if (mode == "EINVAL, too big")
+        {
+            auto closed = client_closed.get_future();
+            require_future(closed, 5s);
+            CHECK(closed.get() == CONN_MTU_EXCEEDED);
+            CHECK(TestHelper::gso_enabled(*client_endpoint));
+            CHECK(TestHelper::send_stats(*client_endpoint).too_big_drops > 0);
+            return;
+        }
+
+        require_future(all_received.get_future(), 5s);
+        {
+            std::lock_guard lock{received_mut};
+            CHECK(received == msg);
+        }
+        CHECK_FALSE(TestHelper::gso_enabled(*client_endpoint));
+    }
+
+    TEST_CASE("002 - A stream arrives intact at an endpoint receiving with GRO", "[002][gro]")
+    {
+        Network test_net{};
+
+        std::vector<std::byte> msg(1'000'000);
+        for (size_t i = 0; i < msg.size(); i++)
+            msg[i] = static_cast<std::byte>(i % 251);
+
+        std::mutex received_mut;
+        std::vector<std::byte> received;
+        std::promise<void> all_received;
+        stream_data_callback server_data_cb = [&](Stream&, std::span<const std::byte> dat) {
+            std::lock_guard lock{received_mut};
+            received.insert(received.end(), dat.begin(), dat.end());
+            if (received.size() == msg.size())
+                all_received.set_value();
+        };
+
+        auto client_established = callback_waiter{[](Connection&) {}};
+        auto [client_tls, server_tls] = defaults::tls_creds_from_ed_keys();
+
+        auto server_endpoint = test_net.endpoint(Address{}, opt::allow_gro{});
+        REQUIRE_NOTHROW(server_endpoint->listen(server_tls, server_data_cb));
+        if (!TestHelper::gro_enabled(*server_endpoint))
+            SKIP("This build of libquic does not support GRO");
+        RemoteAddress server_remote{defaults::SERVER_PUBKEY, LOCALHOST, server_endpoint->local().port()};
+
+        auto client_endpoint = test_net.endpoint(Address{}, client_established, opt::allow_gso{});
+        auto conn = client_endpoint->connect(server_remote, client_tls);
+        REQUIRE(client_established.wait());
+
+        conn->open_stream()->send(msg, nullptr);
+
+        require_future(all_received.get_future(), 5s);
+        {
+            std::lock_guard lock{received_mut};
+            CHECK(received == msg);
+        }
+        // On loopback the client's GSO batches reach the server's socket as merged buffers.
+        if (TestHelper::gso_enabled(*client_endpoint))
+            if (auto merges = TestHelper::gro_merges(*server_endpoint))
+                CHECK(*merges > 0);
+    }
+
+    TEST_CASE("002 - max_udp_payload probe lists", "[002][pmtud]")
+    {
+        auto as_vector = [](const opt::max_udp_payload& mup) {
+            return std::vector<uint16_t>{mup.probes().begin(), mup.probes().end()};
+        };
+
+        CHECK(as_vector(opt::max_udp_payload{1400}) == std::vector<uint16_t>{1372, 1342, 1324, 1232});
+        CHECK(opt::max_udp_payload{1400}.max() == 1372);
+        CHECK(as_vector(opt::max_udp_payload{9000}) ==
+              std::vector<uint16_t>{std::begin(DEFAULT_PMTUD_PROBES), std::end(DEFAULT_PMTUD_PROBES)});
+        CHECK(opt::max_udp_payload{9000}.max() == MAX_PMTUD_UDP_PAYLOAD);
+        CHECK(opt::max_udp_payload{1231}.probes().empty());
+        CHECK(opt::max_udp_payload::minimum().probes().empty());
+        CHECK(opt::max_udp_payload::minimum().max() == 1200);
+        CHECK(opt::max_udp_payload::ipv4(1500).max() == 1472);
+        CHECK(opt::max_udp_payload::ipv6(1500).max() == 1452);
+        CHECK_THROWS_AS(opt::max_udp_payload{1199}, std::invalid_argument);
+
+        std::array<uint16_t, 2> explicit_list{1444, 1300};
+        CHECK(as_vector(opt::max_udp_payload{explicit_list}) == std::vector<uint16_t>{1444, 1300});
+        CHECK(opt::max_udp_payload{explicit_list}.max() == 1444);
+        CHECK(opt::max_udp_payload{std::span<const uint16_t>{}}.probes().empty());
+        for (uint16_t bad : {1200, 1473})
+        {
+            std::array<uint16_t, 2> list{1300, bad};
+            CHECK_THROWS_AS(opt::max_udp_payload{list}, std::invalid_argument);
+        }
+    }
+
+    TEST_CASE("002 - PMTUD reaches the largest probe size, with or without datagrams", "[002][pmtud]")
+    {
+        const bool datagrams = GENERATE(false, true);
+        // Both endpoints are dual-stack, so over 127.0.0.1 the server sees an IPv4-mapped address.
+        const auto localhost = GENERATE("127.0.0.1"s, "::1"s);
+        const bool ipv6 = localhost == "::1";
+        // The probe list on the client, and the size the client should end up at over loopback for
+        // IPv4 and for IPv6 (which skips sizes above MAX_IPV6_UDP_PAYLOAD).
+        const auto [list, expected_v4, expected_v6] = GENERATE(table<std::string, size_t, size_t>({
+                {"default", MAX_PMTUD_UDP_PAYLOAD, MAX_IPV6_UDP_PAYLOAD},
+                {"explicit default", MAX_PMTUD_UDP_PAYLOAD, MAX_IPV6_UDP_PAYLOAD},
+                {"max 1330", 1324, 1324},
+                {"max 9000", MAX_PMTUD_UDP_PAYLOAD, MAX_IPV6_UDP_PAYLOAD},
+                {"only 1406", 1406, 1406},
+                {"only 1472", 1472, 1200},
+                {"minimum", 1200, 1200},
+        }));
+        const size_t expected = ipv6 ? expected_v6 : expected_v4;
+        INFO("probe list: " << list << ", datagrams: " << datagrams << ", via " << localhost);
+
+        Network test_net{};
+
+        auto client_established = callback_waiter{[](Connection&) {}};
+        auto [client_tls, server_tls] = defaults::tls_creds_from_ed_keys();
+
+        std::shared_ptr<Endpoint> server_endpoint, client_endpoint;
+        std::optional<opt::enable_datagrams> dgrams;
+        if (datagrams)
+            dgrams.emplace(Splitting::ACTIVE);
+        std::optional<opt::max_udp_payload> cap;
+        const std::array<uint16_t, 1> only_1406{1406}, only_1472{1472};
+        if (list == "explicit default")
+            cap.emplace(std::span<const uint16_t>{DEFAULT_PMTUD_PROBES});
+        else if (list == "max 1330")
+            cap.emplace(1330);
+        else if (list == "max 9000")
+            cap.emplace(9000);
+        else if (list == "only 1406")
+            cap.emplace(only_1406);
+        else if (list == "only 1472")
+            cap.emplace(only_1472);
+        else if (list == "minimum")
+            cap.emplace(opt::max_udp_payload::minimum());
+
+        server_endpoint = test_net.endpoint(Address{}, dgrams);
+        REQUIRE_NOTHROW(server_endpoint->listen(server_tls));
+        RemoteAddress server_remote{defaults::SERVER_PUBKEY, localhost, server_endpoint->local().port()};
+
+        client_endpoint = test_net.endpoint(Address{}, client_established, dgrams, cap);
+        auto conn = client_endpoint->connect(server_remote, client_tls);
+        REQUIRE(client_established.wait());
+
+        // Give PMTUD (a few round trips over loopback) time to finish.
+        std::this_thread::sleep_for(300ms);
+
+        auto server_conns = server_endpoint->get_all_conns(Direction::INBOUND);
+        REQUIRE(server_conns.size() == 1);
+        CHECK(TestHelper::path_max_udp_payload(*conn) == expected);
+        // The server probes with the default list, but is held to the client's limit by the
+        // max_udp_payload_size the client advertises; it can still land below the client's size,
+        // at the largest default size that fits.
+        auto server_max = TestHelper::path_max_udp_payload(*server_conns.front());
+        CHECK(server_max <= expected);
+        if (list == "max 1330")
+            CHECK(server_max == 1324);
+        else if (list == "default" || list == "explicit default" || list == "max 9000")
+            CHECK(server_max == expected);
+    }
+
+    TEST_CASE("002 - Packets refused as too big for the path", "[002][pmtud][senderr]")
+    {
+        // Declared before the Network, which closes the connection (calling this) as it shuts down.
+        std::promise<uint64_t> client_closed;
+        std::atomic<bool> closed_once{false};
+        connection_closed_callback on_client_closed = [&](Connection&, uint64_t ec) {
+            if (!closed_once.exchange(true))
+                client_closed.set_value(ec);
+        };
+
+        Network test_net{};
+
+        auto client_established = callback_waiter{[](Connection&) {}};
+        auto [client_tls, server_tls] = defaults::tls_creds_from_ed_keys();
+
+        auto server_endpoint = test_net.endpoint(Address{});
+        REQUIRE_NOTHROW(server_endpoint->listen(server_tls));
+        RemoteAddress server_remote{defaults::SERVER_PUBKEY, LOCALHOST, server_endpoint->local().port()};
+
+        auto client_endpoint = test_net.endpoint(Address{}, client_established, on_client_closed);
+        if (!TestHelper::simulate_mtu(*client_endpoint, 0))
+            SKIP("Simulating a path MTU requires a debug build of libquic");
+
+        // Packets above 1400 bytes are refused, so the largest probe size that fits is 1372.
+        constexpr size_t simulated_mtu = 1400;
+        auto closed = client_closed.get_future();
+
+        SECTION("Refused PMTUD probes are just dropped")
+        {
+            REQUIRE(TestHelper::simulate_mtu(*client_endpoint, simulated_mtu));
+            auto conn = client_endpoint->connect(server_remote, client_tls);
+            REQUIRE(client_established.wait());
+
+            // 1452 fails, then 1372 succeeds, then 1444 and 1406 fail; each failure takes a few
+            // PTOs to be given up on, but the refusals themselves happen as each probe is sent.
+            for (int i = 0; i < 50 && TestHelper::path_max_udp_payload(*conn) < 1372; i++)
+                std::this_thread::sleep_for(50ms);
+            std::this_thread::sleep_for(1s);
+
+            CHECK(TestHelper::path_max_udp_payload(*conn) == 1372);
+            CHECK(TestHelper::send_stats(*client_endpoint).too_big_drops > 0);
+            CHECK(closed.wait_for(0s) == std::future_status::timeout);
+        }
+
+        SECTION("A refused packet within the confirmed size closes the connection")
+        {
+            auto conn = client_endpoint->connect(server_remote, client_tls);
+            REQUIRE(client_established.wait());
+            for (int i = 0; i < 50 && TestHelper::path_max_udp_payload(*conn) < MAX_PMTUD_UDP_PAYLOAD; i++)
+                std::this_thread::sleep_for(20ms);
+            REQUIRE(TestHelper::path_max_udp_payload(*conn) == MAX_PMTUD_UDP_PAYLOAD);
+
+            // ngtcp2 can't lower the size it has confirmed, so every full-size packet would keep
+            // failing: the connection closes instead.
+            REQUIRE(TestHelper::simulate_mtu(*client_endpoint, simulated_mtu));
+            auto s = conn->open_stream();
+            s->send(std::string(100'000, 'x'));
+
+            REQUIRE(closed.wait_for(5s) == std::future_status::ready);
+            CHECK(closed.get() == CONN_MTU_EXCEEDED);
+        }
+    }
+
+    TEST_CASE("002 - UDP sockets are set not to fragment", "[002][dontfrag]")
+    {
+        // IPv4, IPv6 only, and dual-stack (an IPv6 socket that also carries IPv4-mapped traffic)
+        const auto local = GENERATE("127.0.0.1"s, "::1"s, ""s);
+        INFO("bound to [" << local << "]");
+        const bool ipv4 = local == "127.0.0.1";
+        const bool ipv6 = !ipv4;
+        [[maybe_unused]] const bool dual_stack = local.empty();
+
+        Network test_net{};
+        auto ep = test_net.endpoint(Address{local, 0});
+        auto sock = TestHelper::get_sock(*ep);
+
+        auto get = [sock](int level, int opt) -> std::optional<int> {
+#ifdef _WIN32
+            DWORD v = 0;
+            int len = sizeof(v);
+            if (getsockopt(sock, level, opt, reinterpret_cast<char*>(&v), &len) != 0)
+                return std::nullopt;
+#else
+            int v = 0;
+            socklen_t len = sizeof(v);
+            if (getsockopt(sock, level, opt, &v, &len) != 0)
+                return std::nullopt;
+#endif
+            return static_cast<int>(v);
+        };
+
+#if defined(_WIN32)
+        if (ipv4)
+            CHECK(get(IPPROTO_IP, IP_DONTFRAGMENT) == 1);
+        if (ipv6)
+            CHECK(get(IPPROTO_IPV6, IPV6_DONTFRAG) == 1);
+#elif defined(IP_MTU_DISCOVER) && defined(IP_PMTUDISC_PROBE)
+        // Linux also takes the IPv4 option on a dual-stack IPv6 socket, for its IPv4-mapped traffic.
+        if (ipv4 || dual_stack)
+            CHECK(get(IPPROTO_IP, IP_MTU_DISCOVER) == IP_PMTUDISC_PROBE);
+        if (ipv6)
+            CHECK(get(IPPROTO_IPV6, IPV6_MTU_DISCOVER) == IPV6_PMTUDISC_PROBE);
+#elif defined(IP_DONTFRAG)
+        if (ipv4)
+            CHECK(get(IPPROTO_IP, IP_DONTFRAG) == 1);
+#ifdef IPV6_DONTFRAG
+        if (ipv6)
+            CHECK(get(IPPROTO_IPV6, IPV6_DONTFRAG) == 1);
+#endif
+#else
+        SKIP("No don't-fragment socket option on this platform");
+#endif
+    }
+
+    TEST_CASE("002 - Looking up the local address used to reach a peer", "[002][route]")
+    {
+        Loop loop;
+        std::unique_ptr<UDPSocket> sock;
+        auto bind = [&](Address addr) {
+            loop.call_get([&] {
+                sock = std::make_unique<UDPSocket>(loop.get_event_base(), addr, UDPSocket::options{}, [](Packet&&) {});
+            });
+            return sock->address().port();
+        };
+
+        SECTION("A socket bound to a specific address always uses it")
+        {
+            bind(Address{"127.0.0.1", 0});
+            CHECK(sock->local_address_for(Address{"127.0.0.1", 4433}) == sock->address());
+        }
+        SECTION("An IPv4 any-address socket uses the routed source address")
+        {
+            auto port = bind(Address{ipv4{}});
+            CHECK(sock->local_address_for(Address{"127.0.0.1", 4433}) == Address{"127.0.0.1", port});
+        }
+        SECTION("An IPv6-only any-address socket uses the routed source address")
+        {
+            auto port = bind(Address{ipv6{}});
+            CHECK(sock->local_address_for(Address{"::1", 4433}) == Address{"::1", port});
+        }
+        SECTION("A dual-stack socket reaches IPv4 peers at IPv4-mapped addresses")
+        {
+            auto port = bind(Address{});
+            CHECK(sock->local_address_for(Address{"127.0.0.1", 4433}.mapped_ipv4_as_ipv6()) ==
+                  Address{"127.0.0.1", port}.mapped_ipv4_as_ipv6());
+            CHECK(sock->local_address_for(Address{"::1", 4433}) == Address{"::1", port});
+        }
+
+        loop.call_get([&] { sock.reset(); });
     }
 }  // namespace oxen::quic::test

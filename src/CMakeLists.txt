@@ -2,7 +2,10 @@ set(libquic_send_allowed "gso, sendmmsg, sendmsg")
 
 configure_file(version.cpp.in version.cpp @ONLY)
 
-session_dep(libngtcp2 1.1.0 WITH libngtcp2_crypto_gnutls)
+# 1.26.0 stops a server keeping a path's max UDP payload size when the client's IP address changes,
+# which stalls the connection when the new path's MTU is smaller.  session-deps' 1.25.0 carries that
+# fix as a patch.
+session_dep(libngtcp2 1.26.0 WITH libngtcp2_crypto_gnutls)
 session_dep(gnutls 3.7.2)
 session_dep(nettle 3.5)
 session_dep(libevent_core 2.1 WITH libevent_pthreads)
@@ -75,16 +78,16 @@ set(LIBQUIC_RECVMMSG ${libquic_recvmmsg_default} CACHE BOOL "Use recvmmsg when r
 
 if(LIBQUIC_SEND STREQUAL "gso")
     message(STATUS "Building with sendmmsg+GSO packet sender")
-    target_compile_definitions(quic PUBLIC OXEN_LIBQUIC_UDP_GSO)
+    target_compile_definitions(quic PRIVATE OXEN_LIBQUIC_UDP_GSO)
 elseif(LIBQUIC_SEND STREQUAL "sendmmsg")
     message(STATUS "Building with sendmmsg (without GSO) packet sender")
-    target_compile_definitions(quic PUBLIC OXEN_LIBQUIC_UDP_SENDMMSG)
+    target_compile_definitions(quic PRIVATE OXEN_LIBQUIC_UDP_SENDMMSG)
 else()
     message(STATUS "Building without sendmmsg/GSO packet sending")
 endif()
 
 if(LIBQUIC_RECVMMSG)
-    target_compile_definitions(quic PUBLIC OXEN_LIBQUIC_RECVMMSG)
+    target_compile_definitions(quic PRIVATE OXEN_LIBQUIC_RECVMMSG)
     message(STATUS "Building with recvmmsg support")
 else()
     message(STATUS "Building without recvmmsg support")
