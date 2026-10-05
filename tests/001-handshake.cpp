@@ -57,6 +57,9 @@ namespace oxen::quic::test
             CHECK(empty_addr == Address{"::", 0});
             CHECK(good_addr.is_set());
 
+            CHECK(Address{static_cast<const ngtcp2_addr&>(good_addr)} == good_addr);
+            CHECK(Address{static_cast<const ngtcp2_addr&>(public_ipv6)} == public_ipv6);
+
             CHECK(empty_addr.is_any_addr());
 #ifndef OXEN_QUIC_ADDRESS_NO_DUAL_STACK
             CHECK(empty_addr.is_ipv6());
@@ -628,10 +631,10 @@ namespace oxen::quic::test
         CHECK(client_established.wait());
         CHECK(server_established.wait());
 
-        // Client should see it's any address as local:
-        CHECK(client_path.local.host() == "0.0.0.0");
-        // But server should see the address the client connected to, even though it's listening on
-        // the any address:
+        // Both should see the actual addresses in use, even though both are listening on the any
+        // address: the client the source address it reaches the server from, and the server the
+        // address the client connected to.
+        CHECK(client_path.local.host() == "127.0.0.1");
         CHECK(server_path.local.host() == "127.0.0.1");
     }
 
@@ -674,7 +677,9 @@ namespace oxen::quic::test
         CHECK(client_established.wait());
         CHECK(server_established.wait());
 
-        CHECK(client_path.local.host() == "0.0.0.0");
+        // The OS picks which loopback address the client sends from (127.0.0.1 on Linux).
+        CHECK(client_path.local.is_loopback());
+        CHECK_FALSE(client_path.local.is_any_addr());
         CHECK(server_path.local.host() == "127.0.0.2");
     }
 
@@ -697,8 +702,9 @@ namespace oxen::quic::test
 
         Network test_net{};
 
+        // Only touched on the loop thread: both are assigned in one loop job (below), so the key
+        // verify callbacks that read them can't run until both are set.
         std::shared_ptr<Connection> server_ci, client_ci;
-        std::mutex ci_mutex;
 
         auto client_tls = GNUTLSCreds::make_from_ed_keys(C_SEED, C_PUBKEY);
         auto server_tls = GNUTLSCreds::make_from_ed_keys(S_SEED, S_PUBKEY);
@@ -726,12 +732,10 @@ namespace oxen::quic::test
         };
 
         server_tls->require_client_keys([&](std::span<const unsigned char> key, std::string_view) {
-            std::lock_guard lock{ci_mutex};
             return defer_hook(view(key), S_PUBKEY, C_PUBKEY, server_ci);
         });
 
         client_tls->require_client_keys([&](std::span<const unsigned char> key, std::string_view) {
-            std::lock_guard lock{ci_mutex};
             return defer_hook(view(key), C_PUBKEY, S_PUBKEY, client_ci);
         });
 
@@ -761,11 +765,10 @@ namespace oxen::quic::test
             server_endpoint->listen(server_tls);
             client_endpoint->listen(client_tls);
 
-            {
-                std::lock_guard lock{ci_mutex};
+            test_net.loop()->call_get([&] {
                 client_ci = client_endpoint->connect(client_remote, client_tls);
                 server_ci = server_endpoint->connect(server_remote, server_tls);
-            }
+            });
 
             CHECK(client_established.wait());
 
@@ -794,11 +797,10 @@ namespace oxen::quic::test
             server_endpoint->listen(server_tls);
             client_endpoint->listen(client_tls);
 
-            {
-                std::lock_guard lock{ci_mutex};
+            test_net.loop()->call_get([&] {
                 client_ci = client_endpoint->connect(client_remote, client_tls);
                 server_ci = server_endpoint->connect(server_remote, server_tls, server_closed_conn_level);
-            }
+            });
 
             CHECK(client_established.wait());
             client_endpoint->close_conns();

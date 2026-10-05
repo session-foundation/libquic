@@ -77,16 +77,51 @@ namespace oxen::quic
     inline constexpr std::chrono::seconds DEFAULT_IDLE_TIMEOUT = 30s;
 
     // NGTCP2 sets the path_pmtud_payload to 1200 on connection creation, then discovers upwards
-    // to a theoretical max of 1452. In 'lazy' mode, we take in split packets under the current max
-    // pmtud size. In 'greedy' mode, we take in up to double the current pmtud size to split amongst
-    // two datagrams. (Note: NGTCP2_MAX_UDP_PAYLOAD_SIZE is badly named, so we're using more accurate
-    // ones)
+    // to at most MAX_PMTUD_UDP_PAYLOAD. In 'lazy' mode, we take in split packets under the current
+    // max pmtud size. In 'greedy' mode, we take in up to double the current pmtud size to split
+    // amongst two datagrams. (Note: NGTCP2_MAX_UDP_PAYLOAD_SIZE is badly named, so we're using more
+    // accurate ones)
 
     inline constexpr size_t MIN_UDP_PAYLOAD = 1200;  // == NGTCP2_MAX_UDP_PAYLOAD_SIZE
     inline constexpr size_t MIN_LAZY_UDP_PAYLOAD = MIN_UDP_PAYLOAD;
     inline constexpr size_t MIN_GREEDY_UDP_PAYLOAD = 2 * MIN_LAZY_UDP_PAYLOAD;
-    inline constexpr size_t MAX_PMTUD_UDP_PAYLOAD = 1452;  // == NGTCP2_MAX_PMTUD_UDP_PAYLOAD_SIZE
+    // The largest UDP payload we send or receive: what a 1500-byte (i.e. Ethernet) MTU carries over
+    // IPv4 (1500 - 20 - 8).
+    inline constexpr size_t MAX_PMTUD_UDP_PAYLOAD = 1472;
     inline constexpr size_t MAX_GREEDY_PMTUD_UDP_PAYLOAD = 2 * MAX_PMTUD_UDP_PAYLOAD;
+    // The largest UDP payload we send on IPv6 connections: what a 1500-byte MTU carries over IPv6
+    // (1500 - 40 - 8).
+    inline constexpr size_t MAX_IPV6_UDP_PAYLOAD = 1452;
+
+    // The UDP payload sizes path MTU discovery probes.  ngtcp2 walks the list once, in order,
+    // probing each size unless it is no larger than the largest size confirmed so far, or no
+    // smaller than the smallest size that has failed; the order therefore decides the search.
+    // MTUs below are IPv6 (payload + 48) unless stated otherwise.
+    //
+    // 1372 and 1324 are the smallest path sizes at which session-router can carry a tunnelled QUIC
+    // connection's packets without splitting them; below them tunnels still work, but every
+    // full-size packet is split across two datagram pieces.  Its tunnels pin the inner connection to
+    // 1200-byte packets and send each one, with session-router's own headers added, as a single
+    // datagram on a link connection that has datagram splitting enabled.  libquic sends a datagram
+    // whole only if it fits in the path size after the link connection's own packet overhead: 46
+    // bytes, i.e. DATAGRAM_OVERHEAD_1RTT plus 2 for the split ID.
+    inline constexpr uint16_t DEFAULT_PMTUD_PROBES[] = {
+            1452,  // 1500 (Ethernet) MTU; tried first because it also fits that MTU over IPv4
+            1472,  // 1500 MTU over IPv4
+            1372,  // 1420 MTU (WireGuard).  Also the split threshold (not a limit: smaller paths still
+                   // work, by splitting) for session-router's UDP tunnel at the 1200 QUIC minimum,
+                   // which adds 126 bytes to each packet (a 48-byte IPv6 + UDP header, 37 bytes of
+                   // session layer and 41 of path layer): 1200 + 126, + 46 for the link connection's
+                   // own packet overhead = 1372.
+            1444,  // 1492 MTU (PPPoE)
+            1406,  // 1454 MTU
+            1342,  // 1390 MTU
+            1324,  // The split threshold (not a limit: smaller paths still work, by splitting) for
+                   // session-router's TCP tunnel at the 1200 QUIC minimum, which adds 78 bytes to each
+                   // packet (37 of session layer and 41 of path layer, with no IP header): 1200 + 78,
+                   // + 46 for the link connection's own packet overhead = 1324.
+            1232,  // 1280 MTU, the IPv6 minimum
+    };
 
     // This is the maximum overhead in the UDP packet of sending a packet containing only one single
     // datagram, and is used to determine the maximum datagram size we can send.
@@ -114,14 +149,13 @@ namespace oxen::quic
     // + 2 bytes datagram length.  (As above, should be optional but isn't with current ngtcp2).
     inline constexpr size_t DATAGRAM_OVERHEAD_0RTT = 1 + 4 + 1 + 20 + 1 + 20 + 2 + 4 + 1 + 2;
 
-    // Maximum number of packets we can send in one batch when using sendmmsg/GSO, and maximum we
-    // receive in one batch when using recvmmsg.
+    // Maximum number of packets we can send in one batch when using sendmmsg/GSO.
     inline constexpr size_t DATAGRAM_BATCH_SIZE = 24;
 
     // Maximum number of packets we will receive at once before returning control to the event loop
     // to re-call the packet receiver if there are additional packets.  (This limit is to prevent
-    // loop starvation in the face of heavy incoming packets.).  Note that When using recvmmsg then
-    // we can overrun up to the next integer multiple of DATAGRAM_BATCH_SIZE.
+    // loop starvation in the face of heavy incoming packets.)  recvmmsg receives up to this many in
+    // a single call.
     inline constexpr size_t MAX_RECEIVE_PER_LOOP = 64;
 
     // The minimum size stateless reset packet we will send, as proscribed by section 10.3.3 of the
