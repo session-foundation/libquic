@@ -1,3 +1,20 @@
+oxen-libquic (1.12.0-1~ubuntu2404) noble; urgency=medium
+
+  * Allow 1.25.0 when building deb
+  * Require patched ngtcp2 1.25.0
+  * Build with Woodpecker via .woodpecker/override-deb.star
+  * Assert the split lookahead invariant instead of a guard that never applied
+  * Release queued bytes when dropping unsendable datagrams
+  * Count only unsent datagram pieces as pending bytes
+  * Reassemble split datagrams in two alternating blocks of slots
+  * Bump version to 1.12.0
+  * Make whichever connection owns the stall go away in the discard test
+  * Make the BTRequestStream timeout test independent of event loop stalls
+  * Run the speedtest datagram test over a control stream
+  * Compare the send-path tests' payloads with bytes_diff
+
+ -- Jason Rhinelander <jason@session.foundation>  Wed, 07 Oct 2026 13:20:49 -0300
+
 oxen-libquic (1.11.0-1~ubuntu2404) noble; urgency=medium
 
   * ci-upload: upload .ddeb debug packages and .buildinfo files
