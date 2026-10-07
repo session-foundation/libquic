@@ -466,7 +466,7 @@ namespace oxen::quic::test
         require_future(data_promise.get_future());
 
         REQUIRE(counter == bufsize);
-        REQUIRE(received == successful_msg);
+        REQUIRE(bytes_diff(received, successful_msg) == "");
     }
 
     namespace

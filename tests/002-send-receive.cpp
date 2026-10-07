@@ -1168,7 +1168,7 @@ namespace oxen::quic::test
         {
             std::lock_guard lock{received_mut};
             for (auto& [s, r] : received)
-                CHECK(r == msg);
+                CHECK(bytes_diff(r, msg) == "");
         }
 
         auto stats = TestHelper::send_stats(*client_endpoint);
@@ -1257,7 +1257,7 @@ namespace oxen::quic::test
         {
             std::lock_guard lock{received_mut};
             REQUIRE(received.size() == 1);
-            CHECK(received.begin()->second == msg);
+            CHECK(bytes_diff(received.begin()->second, msg) == "");
         }
 
         owner->close_connection();
@@ -1395,7 +1395,7 @@ namespace oxen::quic::test
         {
             std::lock_guard lock{received_mut};
             for (auto& [s, r] : received)
-                CHECK(r == msg);
+                CHECK(bytes_diff(r, msg) == "");
         }
 
         auto stats = TestHelper::send_stats(*client_endpoint);
@@ -1452,7 +1452,7 @@ namespace oxen::quic::test
         require_future(all_received.get_future(), 5s);
         {
             std::lock_guard lock{received_mut};
-            CHECK(received == msg);
+            CHECK(bytes_diff(received, msg) == "");
         }
 
         auto stats = TestHelper::send_stats(*client_endpoint);
@@ -1558,7 +1558,7 @@ namespace oxen::quic::test
         require_future(all_received.get_future(), 5s);
         {
             std::lock_guard lock{received_mut};
-            CHECK(received == msg);
+            CHECK(bytes_diff(received, msg) == "");
         }
         CHECK_FALSE(TestHelper::gso_enabled(*client_endpoint));
     }
@@ -1599,7 +1599,7 @@ namespace oxen::quic::test
         require_future(all_received.get_future(), 5s);
         {
             std::lock_guard lock{received_mut};
-            CHECK(received == msg);
+            CHECK(bytes_diff(received, msg) == "");
         }
         // On loopback the client's GSO batches reach the server's socket as merged buffers.
         if (TestHelper::gso_enabled(*client_endpoint))

@@ -444,6 +444,10 @@ namespace oxen::quic
                 static_cast<unsigned char>(*a),
                 static_cast<unsigned char>(*e));
     }
+    inline std::string bytes_diff(std::span<const std::byte> actual, std::span<const std::byte> expected)
+    {
+        return bytes_diff(view(actual), view(expected));
+    }
 
     // Helper class for persistent zerortt storage.  This loads from disk on construction, and
     // replaces the content on disk whenever a new entry is added.
