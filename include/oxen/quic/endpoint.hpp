@@ -141,6 +141,8 @@ namespace oxen::quic
 
         int datagram_bufsize() const { return _rbufsize; }
 
+        int datagram_reorder_limit() const { return _dgram_reorder_limit; }
+
         Splitting splitting_policy() const { return _policy; }
 
         void close_connection(Connection& conn, io_error ec = io_error{0}, std::optional<std::string> msg = std::nullopt);
@@ -216,7 +218,8 @@ namespace oxen::quic
         bool _datagrams{false};
         bool _packet_splitting{false};
         Splitting _policy{Splitting::NONE};
-        int _rbufsize{4096};
+        int _rbufsize{512};
+        int _dgram_reorder_limit{1024};
         size_t _dgram_queue_limit{std::numeric_limits<size_t>::max()};
 
         opt::manual_routing _manual_routing;
@@ -363,6 +366,9 @@ namespace oxen::quic
             size_t no_buffer_drops = 0;  // Packets dropped for lack of local buffer space (ENOBUFS)
         };
         debug_send_stats _debug_send_stats() const;
+        // Returns the connection whose packets are stalled in the send batch, if it is stalled and
+        // that connection is still around.
+        const Connection* _debug_stall_owner() const;
 
         // Drops a connection from the endpoint.  This is dangerous to call from *within* methods on
         // a connection itself, and generally should be deferred via a call_soon.
