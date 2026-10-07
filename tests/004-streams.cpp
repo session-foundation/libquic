@@ -1170,7 +1170,10 @@ namespace oxen::quic::test
                 b_resp = m.body();
         }};
 
-        stream->command("null", "", apple_sucks_factor * 50ms, a_cb);
+        // A's timeout is long enough that the event loop stalling (as it can on a loaded CI machine)
+        // can't make it expire within the test, so B timing out promptly can only mean it didn't
+        // have to wait for A.
+        stream->command("null", "", 1h, a_cb);
 
         // Should do nothing yet:
         REQUIRE_FALSE(a_cb.wait(apple_sucks_factor * 10ms));
@@ -1183,8 +1186,9 @@ namespace oxen::quic::test
         CHECK(b_resp == "TIMEOUT");
         CHECK_FALSE(a_cb.is_ready());
 
+        // Closing fails A, which has to happen before a_cb and a_resp go away.
+        conn->close_connection();
         REQUIRE(a_cb.wait(apple_sucks_factor * 75ms));
-        CHECK(a_resp == "TIMEOUT");
     }
 
     TEST_CASE("004 - Exceptions when opening/queueing streams on a closed connection", "[004][streams][dead][exception]")

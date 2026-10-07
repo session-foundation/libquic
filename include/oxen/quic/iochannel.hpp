@@ -106,7 +106,6 @@ namespace oxen::quic
 
       protected:
         friend class Connection;
-        friend struct rotating_buffer;
 
         Connection* _conn;
 
