@@ -38,10 +38,6 @@ namespace oxen::quic
     class Endpoint;
     class Network;
     class Loop;
-    namespace dgram
-    {
-        struct rotating_buffer;
-    }
 
     inline constexpr uint64_t MAX_ACTIVE_CIDS{4};
     inline constexpr size_t NGTCP2_RETRY_SCIDLEN{18};
@@ -60,7 +56,6 @@ namespace oxen::quic
         friend class Stream;
         friend class Datagrams;
         friend class TestHelper;
-        friend struct dgram::rotating_buffer;
         friend struct connection_callbacks;
         friend void conn_set_validated(Connection&);
 
