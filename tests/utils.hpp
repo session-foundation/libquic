@@ -79,7 +79,7 @@ namespace oxen::quic
         static int disable_dgram_counter(Connection& conn);
         static int get_dgram_debug_counter(Connection& conn);
 
-        static int get_datagram_last_cleared(Datagrams& dg);
+        static int get_datagrams_stored(Datagrams& dg);
         static size_t get_dgram_drop_count(Datagrams& dg);
 
         // Bumps the connection's next reference id to make it easier to tell which connection is
@@ -161,6 +161,9 @@ namespace oxen::quic
 
         // Returns the endpoint's send statistics so far (all zero in non-debug builds).
         static Endpoint::debug_send_stats send_stats(Endpoint& ep);
+
+        // Returns the connection whose packets are stalled in the endpoint's send batch, if any.
+        static const Connection* send_stall_owner(Endpoint& ep);
 
         // Marks the connection dead, as a fatal ngtcp2 error does, but without also scheduling its
         // close (so that the test controls what happens in between).
