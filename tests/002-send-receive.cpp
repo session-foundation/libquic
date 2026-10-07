@@ -1168,7 +1168,7 @@ namespace oxen::quic::test
         {
             std::lock_guard lock{received_mut};
             for (auto& [s, r] : received)
-                CHECK(r == msg);
+                CHECK(bytes_diff(r, msg) == "");
         }
 
         auto stats = TestHelper::send_stats(*client_endpoint);
@@ -1221,7 +1221,8 @@ namespace oxen::quic::test
         if (!TestHelper::block_sends_for(*client_endpoint, 300ms))
             SKIP("Send stall testing requires a debug build of libquic");
 
-        // A's first send blocks, so A's packets (all it ever gets to send) are the stalled batch.
+        // The first send to block stalls the batch, and nothing either connection tries to send
+        // after that gets out until the stall clears.
         auto stream_a = conn_a->open_stream();
         stream_a->send(msg, nullptr);
         REQUIRE(wait_for([&] { return TestHelper::send_stats(*client_endpoint).stalls == 1; }, 200ms, 1ms));
@@ -1230,18 +1231,25 @@ namespace oxen::quic::test
         stream_b->send(msg, nullptr);
         REQUIRE(wait_for([&] { return TestHelper::send_stats(*client_endpoint).skips >= 1; }, 200ms, 1ms));
 
+        // That is usually A's send above, but either connection can still have had a post-handshake
+        // packet (such as an ACK) to send when sends got blocked, so the owner may be either.
+        auto* stall_owner = TestHelper::send_stall_owner(*client_endpoint);
+        REQUIRE((stall_owner == conn_a.get() || stall_owner == conn_b.get()));
+        auto& owner = stall_owner == conn_a.get() ? conn_a : conn_b;
+
         SECTION("owner closed during the stall")
         {
-            conn_a->close_connection();
+            owner->close_connection();
             REQUIRE(wait_for(
-                    [&] { return client_endpoint->job_queue.call_get([&] { return conn_a->is_closing(); }); }, 200ms, 1ms));
+                    [&] { return client_endpoint->job_queue.call_get([&] { return owner->is_closing(); }); }, 200ms, 1ms));
         }
         SECTION("owner died during the stall")
         {
-            TestHelper::mark_dead(*conn_a);
+            TestHelper::mark_dead(*owner);
         }
 
-        // B was waiting on the stall, so it gets woken (and sends) once the socket unblocks.
+        // The other connection was waiting on the stall, so it gets woken (and sends) once the
+        // socket unblocks; the owner never gets to send its stream.
         require_future(one_received.get_future(), 5s);
         std::this_thread::sleep_for(100ms);
 
@@ -1249,10 +1257,10 @@ namespace oxen::quic::test
         {
             std::lock_guard lock{received_mut};
             REQUIRE(received.size() == 1);
-            CHECK(received.begin()->second == msg);
+            CHECK(bytes_diff(received.begin()->second, msg) == "");
         }
 
-        conn_a->close_connection();
+        owner->close_connection();
     }
 
     TEST_CASE("002 - A partly sent batch keeps its unsent packets intact", "[002][stall][partial]")
@@ -1387,7 +1395,7 @@ namespace oxen::quic::test
         {
             std::lock_guard lock{received_mut};
             for (auto& [s, r] : received)
-                CHECK(r == msg);
+                CHECK(bytes_diff(r, msg) == "");
         }
 
         auto stats = TestHelper::send_stats(*client_endpoint);
@@ -1444,7 +1452,7 @@ namespace oxen::quic::test
         require_future(all_received.get_future(), 5s);
         {
             std::lock_guard lock{received_mut};
-            CHECK(received == msg);
+            CHECK(bytes_diff(received, msg) == "");
         }
 
         auto stats = TestHelper::send_stats(*client_endpoint);
@@ -1550,7 +1558,7 @@ namespace oxen::quic::test
         require_future(all_received.get_future(), 5s);
         {
             std::lock_guard lock{received_mut};
-            CHECK(received == msg);
+            CHECK(bytes_diff(received, msg) == "");
         }
         CHECK_FALSE(TestHelper::gso_enabled(*client_endpoint));
     }
@@ -1591,7 +1599,7 @@ namespace oxen::quic::test
         require_future(all_received.get_future(), 5s);
         {
             std::lock_guard lock{received_mut};
-            CHECK(received == msg);
+            CHECK(bytes_diff(received, msg) == "");
         }
         // On loopback the client's GSO batches reach the server's socket as merged buffers.
         if (TestHelper::gso_enabled(*client_endpoint))

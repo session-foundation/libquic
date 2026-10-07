@@ -3,6 +3,7 @@
 #include "address.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <span>
 #include <stdexcept>
@@ -185,14 +186,17 @@ namespace oxen::quic
         /// to Network::Endpoint(...) will enable datagrams without packet-splitting. From there, pass
         /// `Splitting::ACTIVE` to the constructor to enable packet-splitting.
         ///
-        /// The size of the rotating datagram buffer can also be specified as a second parameter to
-        /// the constructor. Buffer size is subdivided amongst 4 equally sized buffer rows, so the
-        /// bufsize must be perfectly divisible by 4, and must be at least 32 (but significantly
-        /// larger is recommended), and can be at most 16384.  The default size is 4096.
+        /// The size of the buffer that reassembles split datagrams can also be specified as a second
+        /// parameter to the constructor: a power of two from 64 to 8192, defaulting to 512.  The
+        /// two halves of a split datagram are always reassembled if they arrive within bufsize/2
+        /// datagrams of each other, and sometimes (depending on where they fall) up to bufsize-1
+        /// apart.  The halves of a datagram are sent at most the other side's split lookahead plus
+        /// 2 (8+2 by default) datagrams apart, so bufsize/2 must comfortably exceed that plus any
+        /// reordering on the network path; it is up to the application to ensure it uses
+        /// compatible values on each side as this is not enforced.  The buffer only uses memory on
+        /// connections that receive split datagrams.
         ///
-        /// It must also be, at bare minimum, at least double the datagram lookahead plus 2 (8+2 by
-        /// default) that the other side of the connection is using, but it is up to the application
-        /// to ensure it uses a compatible value on each side as this is not enforced.
+        /// See reorder_limit() for how datagrams arriving later than that are handled.
         ///
         /// The max size of a transmittable datagram can be queried directly from
         /// Connection::get_max_datagram_size(). At connection initialization, ngtcp2 will default
@@ -206,9 +210,9 @@ namespace oxen::quic
         {
             bool split_packets{false};
             Splitting mode{Splitting::NONE};
-            // Note: this is the size of the entire buffer, divided amongst 4 rows
-            int bufsize{4096};
+            int bufsize{512};
             std::optional<size_t> dgram_queue_limit{std::nullopt};
+            std::optional<int> dgram_reorder_limit{std::nullopt};
 
             // Sets the maximum number of bytes that may be queued for sending on a single
             // connection's datagram channel.  When the limit is exceeded, incoming datagrams are
@@ -225,20 +229,32 @@ namespace oxen::quic
                 return *this;
             }
 
+            // Sets how far behind the newest datagram received another may arrive and still be
+            // treated as merely late: a late split datagram piece that the buffer no longer covers
+            // is dropped, and nothing else changes.  A datagram older than this is instead taken to
+            // mean that the datagram IDs jumped forward after a burst of losses, which clears the
+            // buffer.  A larger limit tolerates more reordering, but widens the range of loss
+            // bursts after which two unrelated halves can be reassembled: losing between about
+            // 16384 - limit and 16384 + bufsize/2 datagrams in a row, since the 14-bit datagram IDs
+            // then wrap around to ones still in the buffer.
+            //
+            // Must be at least bufsize and at most 8192, and is rounded up to a multiple of
+            // bufsize/2.  Defaults to twice bufsize (at most 8192).
+            enable_datagrams& reorder_limit(int limit)
+            {
+                if (limit < bufsize || limit > 8192)
+                    throw std::out_of_range{"Datagram reorder limit must be between bufsize and 8192"};
+                dgram_reorder_limit = limit;
+                return *this;
+            }
+
             enable_datagrams() = default;
             explicit enable_datagrams(bool e) = delete;
             explicit enable_datagrams(Splitting m) : split_packets{true}, mode{m} {}
             explicit enable_datagrams(Splitting m, int b) : split_packets{true}, mode{m}, bufsize{b}
             {
-                if (b < 64)
-                    // This 64 cutoff is somewhat arbitrary, but going much smaller than this will
-                    // start to cause problems with the default packet coalescing lookahead (which,
-                    // by default, can deliver pieces of packets up to 9 datagram packets apart).
-                    throw std::out_of_range{"Bufsize must be >= 64"};
-                if (b > 1 << 14)
-                    throw std::out_of_range{"Bufsize too large"};
-                if (b % 4 != 0)
-                    throw std::invalid_argument{"Bufsize must be evenly divisible between 4 rows"};
+                if (b < 64 || b > 8192 || !std::has_single_bit(static_cast<unsigned>(b)))
+                    throw std::out_of_range{"Datagram bufsize must be a power of two from 64 to 8192"};
             }
         };
 

@@ -47,31 +47,27 @@ struct stream_data
 
 struct dgram_data_t
 {
-    std::shared_ptr<Stream> stream;
-    std::atomic<bool> active = false;
     std::vector<std::byte> msg{};
     uint64_t size;
     uint64_t dgram_size;
     uint64_t n_iter;
-    std::atomic<bool> is_sending = false;
-    std::atomic<bool> is_done = false;
-    std::promise<void> run_prom;
-    std::future<void> running = run_prom.get_future();
-    std::atomic<bool> failed = false;
+    // The number of datagrams the server received, or nullopt if the control stream closed first.
+    std::promise<std::optional<uint64_t>> result_prom;
+    std::future<std::optional<uint64_t>> result = result_prom.get_future();
+    bool answered = false;  // loop thread only
 
-    dgram_data_t(uint64_t size, uint64_t dgram_size) : size{size}, dgram_size{dgram_size}, n_iter{size / dgram_size + 1}
+    dgram_data_t(uint64_t size, uint64_t dgram_size) :
+            size{size}, dgram_size{dgram_size}, n_iter{std::max<uint64_t>((size + dgram_size - 1) / dgram_size, 1)}
     {
         // Oversized message that should be big enough for any datagram size.  We send subspans
-        // of this starting at [1]...[250] for all but the last one (the last one starts at [0]
-        // and has initial byte 0, which the server uses to identify the last packet), to help
-        // identify in trace logging which packet could be going wrong.
+        // of this starting at [1]...[250], so that the server can verify them and so that trace
+        // logging shows which datagram could be going wrong.
         msg.resize(5000);
         for (uint64_t i = 0; i < msg.size(); i++)
             msg[i] = static_cast<std::byte>(i % 256);
     }
 
     std::span<const std::byte> data(size_t pkt_i) { return std::span{msg}.subspan(1 + pkt_i % 250, dgram_size); }
-    std::span<const std::byte> final_data() { return std::span{msg}.subspan(0, dgram_size); }
 };
 
 struct ping_stats
@@ -144,7 +140,12 @@ int main(int argc, char* argv[])
             "threads.");
 
     size_t dgram_size = 0;
-    cli.add_option("--dgram-size", dgram_size, "Datagram size to send for datagram speedtest");
+    // At least 5 bytes, so that the server can't mistake one for a 4-byte ping.
+    cli.add_option(
+               "--dgram-size",
+               dgram_size,
+               "Datagram size to send for datagram speedtest; defaults to the connection's maximum.")
+            ->check(CLI::Range(size_t{5}, size_t{4750}));
 
     int lookahead = -1;
     cli.add_option(
@@ -270,35 +271,24 @@ int main(int argc, char* argv[])
     };
 
     std::optional<dgram_data_t> dgram_data;
-    dgram_data_callback recv_dgram_cb = [&](quic::datagram dg) {
-        log::critical(test_cat, "Calling endpoint receive datagram callback... data received...");
-
-        if (dgram_data->is_sending)
+    stream_data_callback on_dgram_control = [&](Stream&, std::span<const std::byte> data) {
+        if (dgram_data->answered)
+            return;
+        dgram_data->answered = true;
+        if (data.size() != 8)
         {
-            log::error(test_cat, "Got a datagram response ({}B) before we were done sending data!", dg.data.size());
-            dgram_data->failed = true;
-        }
-        else if (dg.data.size() != 5)
-        {
-            log::error(test_cat, "Got unexpected data from the other side: {}B != 5B", dg.data.size());
-            dgram_data->failed = true;
-        }
-        else if (view(dg.data) != "DONE!"sv)
-        {
-            log::error(
-                    test_cat,
-                    "Got unexpected data: expected 'DONE!', got (hex): '{}'",
-                    oxenc::to_hex(dg.data.begin(), dg.data.end()));
-            dgram_data->failed = true;
+            log::error(test_cat, "Got {}B on the datagram test control stream; expected an 8-byte count", data.size());
+            dgram_data->result_prom.set_value(std::nullopt);
         }
         else
-        {
-            dgram_data->failed = false;
-            log::critical(test_cat, "All done, hurray!\n");
-        }
-
-        dgram_data->is_done = true;
-        dgram_data->run_prom.set_value();
+            dgram_data->result_prom.set_value(oxenc::load_little_to_host<uint64_t>(data.data()));
+    };
+    stream_close_callback on_dgram_control_close = [&](Stream&, uint64_t errcode) {
+        if (dgram_data->answered)
+            return;
+        dgram_data->answered = true;
+        log::error(test_cat, "Datagram test control stream closed (error {}) before the server answered", errcode);
+        dgram_data->result_prom.set_value(std::nullopt);
     };
 
     Address client_local{};
@@ -318,9 +308,8 @@ int main(int argc, char* argv[])
     if (gro)
         allow_gro.emplace();
 
-    // The datagram test queues all of its datagrams at once, so the queue has to hold them all (the
-    // data, one more datagram, and the 8-byte count): anything over the limit would be dropped
-    // before being sent, and look like loss on the network.
+    // The datagram test queues all of its datagrams at once, so the queue has to hold them all:
+    // anything over the limit would be dropped before being sent, and look like loss on the network.
     auto client = Endpoint::endpoint(
             loop,
             client_local,
@@ -334,7 +323,7 @@ int main(int argc, char* argv[])
     if (!ping)
     {
         log::info(SPEEDTEST, "Connecting to {}...", server_addr);
-        client_ci = client->connect(server_addr, client_tls, on_stream_data, stream_closed, recv_dgram_cb);
+        client_ci = client->connect(server_addr, client_tls, on_stream_data, stream_closed);
         client_ci->set_split_datagram_lookahead(lookahead);
     }
 
@@ -455,41 +444,42 @@ int main(int argc, char* argv[])
     }
     else if (datagram)
     {
-        uint64_t max_size =
-                std::max<uint64_t>((dgram_size == 0) ? client_ci->get_max_datagram_size() : dgram_size, sizeof(uint8_t));
+        uint64_t max_size = (dgram_size == 0) ? client_ci->get_max_datagram_size() : dgram_size;
 
         dgram_data.emplace(size, max_size);
-        log::info(SPEEDTEST, "Preparing to send {} datagrams of max size {}", dgram_data->n_iter, dgram_data->size);
+        log::info(SPEEDTEST, "Preparing to send {} datagrams of size {}", dgram_data->n_iter, dgram_data->dgram_size);
 
-        std::vector<std::byte> remaining_str;
-        remaining_str.resize(8);
-        oxenc::write_host_as_little(dgram_data->n_iter, remaining_str.data());
-        log::info(test_cat, "Sending datagram count to remote...");
-        client_ci->datagrams()->send(remaining_str, nullptr);
+        // The control stream carries the test's start and end, which must not be lost.
+        auto control = client_ci->open_stream(on_dgram_control, on_dgram_control_close);
+        std::string header(16, '\0');
+        oxenc::write_host_as_little(SPEEDTEST_DGRAM_CONTROL, header.data());
+        oxenc::write_host_as_little(dgram_data->n_iter, header.data() + 8);
+        control->send(std::move(header));
 
-        std::chrono::steady_clock::time_point started_at;
-
-        dgram_data->is_sending = true;
         log::info(test_cat, "Sending datagrams to remote...");
-
-        started_at = std::chrono::steady_clock::now();
+        auto started_at = std::chrono::steady_clock::now();
 
         auto client_dg = client_ci->datagrams();
-        for (uint64_t i = 0; i < dgram_data->n_iter - 1; ++i)
-        {
-            // Just send these with the 0 at the beginning
+        for (uint64_t i = 0; i < dgram_data->n_iter; ++i)
             client_dg->send(dgram_data->data(i), nullptr);
-        }
-        // Send a final one always using i = 0 so that we get the bit of the data starting with the
-        // terminal 0 byte value.
-        client_dg->send(dgram_data->final_data(), nullptr);
 
-        log::info(SPEEDTEST, "All datagrams sent or queued");
-        dgram_data->is_sending = false;
+        // Stream data can be sent ahead of datagrams still queued, so the server is only told the
+        // datagrams are done once they have all actually gone out.
+        while (client_dg->unsent() > 0)
+            std::this_thread::sleep_for(1ms);
+        control->send(std::string(1, static_cast<char>(SPEEDTEST_DGRAMS_SENT)));
+        log::info(SPEEDTEST, "All datagrams sent");
 
-        dgram_data->running.get();
-
+        auto received = dgram_data->result.get();
         auto elapsed = std::chrono::duration<double>{std::chrono::steady_clock::now() - started_at}.count();
+        if (received)
+            fmt::print(
+                    "Server received {} of {} datagrams ({:.3f}%)\n",
+                    *received,
+                    dgram_data->n_iter,
+                    100.0 * *received / dgram_data->n_iter);
+        else
+            fmt::print("OMG failed!\n");
         fmt::print("Elapsed time: {:.5f}s\n", elapsed);
         fmt::print("Speed: {:.5f}MB/s\n", size / 1'000'000.0 / elapsed);
     }
