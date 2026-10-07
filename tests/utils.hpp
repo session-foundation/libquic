@@ -59,6 +59,13 @@ namespace oxen::quic
     inline const std::string TEST_BODY = "test_body"s;
 
     inline const Address DEFAULT_SPEEDTEST_ADDR{LOCALHOST, uint16_t{5500}};
+
+    // A speedtest datagram test runs over a control stream: the client starts it with this value
+    // where a stream test sends its byte count, followed by the 8-byte number of datagrams it will
+    // send, and sends SPEEDTEST_DGRAMS_SENT on it once they have all gone out.  The server replies
+    // with the 8-byte number of datagrams it received.
+    inline constexpr uint64_t SPEEDTEST_DGRAM_CONTROL = std::numeric_limits<uint64_t>::max();
+    inline constexpr std::byte SPEEDTEST_DGRAMS_SENT{'D'};
     inline const Address DEFAULT_DGRAM_SPEED_ADDR{LOCALHOST, uint16_t{5501}};
     inline const Address DEFAULT_PING_ADDR{LOCALHOST, uint16_t{5502}};
 
@@ -79,7 +86,7 @@ namespace oxen::quic
         static int disable_dgram_counter(Connection& conn);
         static int get_dgram_debug_counter(Connection& conn);
 
-        static int get_datagram_last_cleared(Datagrams& dg);
+        static int get_datagrams_stored(Datagrams& dg);
         static size_t get_dgram_drop_count(Datagrams& dg);
 
         // Bumps the connection's next reference id to make it easier to tell which connection is
@@ -161,6 +168,9 @@ namespace oxen::quic
 
         // Returns the endpoint's send statistics so far (all zero in non-debug builds).
         static Endpoint::debug_send_stats send_stats(Endpoint& ep);
+
+        // Returns the connection whose packets are stalled in the endpoint's send batch, if any.
+        static const Connection* send_stall_owner(Endpoint& ep);
 
         // Marks the connection dead, as a fatal ngtcp2 error does, but without also scheduling its
         // close (so that the test controls what happens in between).
@@ -433,6 +443,10 @@ namespace oxen::quic
                 actual.size(),
                 static_cast<unsigned char>(*a),
                 static_cast<unsigned char>(*e));
+    }
+    inline std::string bytes_diff(std::span<const std::byte> actual, std::span<const std::byte> expected)
+    {
+        return bytes_diff(view(actual), view(expected));
     }
 
     // Helper class for persistent zerortt storage.  This loads from disk on construction, and
