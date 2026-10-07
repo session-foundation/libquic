@@ -59,6 +59,13 @@ namespace oxen::quic
     inline const std::string TEST_BODY = "test_body"s;
 
     inline const Address DEFAULT_SPEEDTEST_ADDR{LOCALHOST, uint16_t{5500}};
+
+    // A speedtest datagram test runs over a control stream: the client starts it with this value
+    // where a stream test sends its byte count, followed by the 8-byte number of datagrams it will
+    // send, and sends SPEEDTEST_DGRAMS_SENT on it once they have all gone out.  The server replies
+    // with the 8-byte number of datagrams it received.
+    inline constexpr uint64_t SPEEDTEST_DGRAM_CONTROL = std::numeric_limits<uint64_t>::max();
+    inline constexpr std::byte SPEEDTEST_DGRAMS_SENT{'D'};
     inline const Address DEFAULT_DGRAM_SPEED_ADDR{LOCALHOST, uint16_t{5501}};
     inline const Address DEFAULT_PING_ADDR{LOCALHOST, uint16_t{5502}};
 

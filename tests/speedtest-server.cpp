@@ -67,6 +67,61 @@ int main(int argc, char* argv[])
         return 0;
     };
 
+    struct recv_info
+    {
+        uint64_t n_expected = 0;
+        uint64_t n_received = 0;
+        uint64_t received = 0;
+        uint64_t received_before_current_window = 0;
+        std::chrono::time_point<std::chrono::steady_clock> start_time = std::chrono::steady_clock::now();
+        std::chrono::time_point<std::chrono::steady_clock> last_print = std::chrono::steady_clock::now();
+        size_t last_dgram_size = 0;
+        bool ping = false;
+        // The datagram test's control stream, once it has started.
+        int64_t control_id = -1;
+        bool reported = false;
+    };
+
+    std::unordered_map<ConnectionID, recv_info> conn_dgram_data;
+
+    // Handles data on a datagram test's control stream: its header (when `header`) and then the
+    // client's notice that all of its datagrams have gone out, which is answered right away with
+    // how many arrived.
+    auto dgram_control = [&](Stream& s, std::span<const std::byte> data, bool header) {
+        auto& info = conn_dgram_data[s.reference_id];
+        const auto peer = s.get_conn()->remote();
+        if (header)
+        {
+            if (data.size() < 16)
+            {
+                log::error(test_cat, "Invalid datagram test header: expected 16 bytes, got {}", data.size());
+                return;
+            }
+            info.control_id = s.stream_id();
+            info.n_expected = oxenc::load_little_to_host<uint64_t>(data.data() + 8);
+            log::warning(test_cat, "Datagram test from {}, expecting {} datagrams!", peer, info.n_expected);
+            data = data.subspan(16);
+        }
+        if (data.empty())
+            return;
+        if (data.size() != 1 || data.front() != SPEEDTEST_DGRAMS_SENT || info.reported)
+        {
+            log::error(test_cat, "Unexpected {}B of data on datagram test control stream", data.size());
+            return;
+        }
+        info.reported = true;
+        log::critical(
+                test_cat,
+                "Datagram test complete for {}. Fidelity: {}\% ({} received of {} expected)",
+                peer,
+                info.n_expected ? 100.0 * info.n_received / info.n_expected : 0.0,
+                info.n_received,
+                info.n_expected);
+        std::string reply(8, '\0');
+        oxenc::write_host_as_little(info.n_received, reply.data());
+        s.send(std::move(reply));
+    };
+
     struct stream_info
     {
         uint64_t expected;
@@ -79,6 +134,10 @@ int main(int argc, char* argv[])
     std::map<ConnectionID, std::map<int64_t, stream_info>> csd;
 
     stream_data_callback stream_data = [&](Stream& s, std::span<const std::byte> data) {
+        if (auto dg = conn_dgram_data.find(s.reference_id);
+            dg != conn_dgram_data.end() && dg->second.control_id == s.stream_id())
+            return dgram_control(s, data, false);
+
         auto& sd = csd[s.reference_id];
 
         auto it = sd.find(s.stream_id());
@@ -96,6 +155,8 @@ int main(int argc, char* argv[])
             }
 
             auto size = oxenc::load_little_to_host<uint64_t>(data.data());
+            if (size == SPEEDTEST_DGRAM_CONTROL)
+                return dgram_control(s, data, true);
             data = data.subspan(sizeof(uint64_t));
 
             it = sd.emplace(s.stream_id(), size).first;
@@ -144,20 +205,6 @@ int main(int argc, char* argv[])
         }
     };
 
-    struct recv_info
-    {
-        uint64_t n_expected = 0;
-        uint64_t n_received = 0;
-        uint64_t received = 0;
-        uint64_t received_before_current_window = 0;
-        std::chrono::time_point<std::chrono::steady_clock> start_time = std::chrono::steady_clock::now();
-        std::chrono::time_point<std::chrono::steady_clock> last_print = std::chrono::steady_clock::now();
-        size_t last_dgram_size = 0;
-        bool ping = false;
-    };
-
-    std::unordered_map<ConnectionID, recv_info> conn_dgram_data;
-
     std::vector<std::byte> dgram_rainbow;
     dgram_rainbow.resize(5000);
     for (size_t i = 0; i < dgram_rainbow.size(); i++)
@@ -172,11 +219,10 @@ int main(int argc, char* argv[])
 
         const auto size = dg.data.size();
 
-        if (dgram_data.n_expected == 0 && size == 4)
-        {
+        // Pings are 4 bytes and a datagram test's datagrams at least 5, so a connection whose first
+        // datagram has 4 bytes is pinging.
+        if (dgram_data.n_received == 0 && size == 4)
             dgram_data.ping = true;
-            dgram_data.n_expected = -1;
-        }
         if (dgram_data.ping)
         {
             if (size != 4)
@@ -202,25 +248,6 @@ int main(int argc, char* argv[])
             dgram_data.last_dgram_size = size;
         }
 
-        if (dgram_data.n_expected == 0)
-        {
-            // The very first packet should be 8 bytes containing the uint64_t count of total
-            // packets being sent, not including this initial one.
-            if (size != 8)
-                log::error(test_cat, "Invalid initial packet: expected 8-byte test size, got {} bytes", size);
-            auto count = oxenc::load_little_to_host<uint64_t>(dg.data.data());
-            dgram_data.n_expected = count;
-            log::warning(
-                    test_cat,
-                    "First data from new connection {} datagram channel, expecting {} datagrams!",
-                    dg.conn.remote(),
-                    dgram_data.n_expected);
-            return;
-        }
-
-        // The final packet starts with a \x00; up until then we get starts from 1,2,...250,1,2,...,250,1,2,...
-        const bool done = dg.data[0] == std::byte{0};
-
         auto& info = dgram_data;
 
         info.received += size;
@@ -241,11 +268,10 @@ int main(int argc, char* argv[])
 
         if (verify_datagrams)
         {
-            // The first byte value is itself the rainbow offset, and goes 1->250 repeatedly until
-            // the final packet, which has initial byte 0:
+            // The first byte value is itself the rainbow offset, and goes 1->250 repeatedly.
             size_t offset = static_cast<uint8_t>(dg.data[0]);
             bool bad = false;
-            if (offset > 250)
+            if (offset < 1 || offset > 250)
             {
                 bad = true;
                 log::error(log_cat, "Datagram {} verification found invalid first byte value {}", info.n_received, offset);
@@ -264,31 +290,11 @@ int main(int argc, char* argv[])
             }
         }
 
-        bool need_more = info.n_received < info.n_expected;
         info.n_received++;
 
-        if (info.n_received > info.n_expected)
-        {
+        // The expected count isn't known yet if the control stream's header hasn't arrived.
+        if (info.n_expected && info.n_received > info.n_expected)
             log::critical(test_cat, "Received too many datagrams ({} > {})!", info.n_received, info.n_expected);
-
-            if (!need_more)
-                return;
-        }
-
-        if (done)
-        {
-            auto reception_rate = ((float)info.n_received / (float)info.n_expected) * 100;
-
-            log::critical(
-                    test_cat,
-                    "Datagram test complete for {}. Fidelity: {}\% ({} received of {} expected)",
-                    dg.conn.remote(),
-                    reception_rate,
-                    info.n_received,
-                    info.n_expected);
-
-            dg.datagrams.send("DONE!"s);
-        }
     };
 
     Loop loop;
