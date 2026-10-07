@@ -24,37 +24,59 @@ namespace oxen::quic
 
     namespace dgram
     {
-        struct received
+        // Reassembles split datagrams.  The 14-bit counters in datagram IDs are grouped into blocks
+        // of bufsize/2, and the pieces of the newest block seen and of the block before it are held
+        // in alternate halves of the slots (the half being the block number's lowest bit).  Every
+        // datagram received, split or not, moves the newest block forward, clearing the half that
+        // each newly reached block reuses, so a held piece is discarded once bufsize/2 to
+        // bufsize-1 newer datagram IDs have been seen.  A datagram from up to the reorder limit
+        // behind the newest is late, and anything else means the IDs have jumped forward.
+        class rotating_buffer
         {
-            uint16_t id{0};
-            bool first_part = false;
-            uint16_t data_size{0};
-            std::array<std::byte, MAX_PMTUD_UDP_PAYLOAD> data;
+          public:
+            rotating_buffer(int bufsize, int reorder_limit);
 
-            received(uint16_t dgid, std::span<const std::byte> d) :
-                    id{dgid}, first_part{dgid % 4 == 2}, data_size{static_cast<uint16_t>(d.size())}
-            {
-                std::memcpy(data.data(), d.data(), data_size);
-            }
-        };
-
-        struct rotating_buffer
-        {
-            int row{0}, col{0}, last_cleared{-1};
-            Datagrams& datagram;
-            const int bufsize;
-            const int rowsize;
-            // tracks the number of partial datagrams held in each buffer bucket
-            std::array<int, 4> currently_held{0, 0, 0, 0};
-
-            explicit rotating_buffer() = delete;
-            explicit rotating_buffer(Datagrams& d);
-
-            std::array<std::vector<std::unique_ptr<received>>, 4> buf;
-
+            // Takes a received piece of a split datagram, and returns the reassembled datagram if
+            // this piece completes it.
             std::optional<std::vector<std::byte>> receive(std::span<const std::byte> data, uint16_t dgid);
-            void clear_row(int index);
-            int datagrams_stored() const;
+
+            // Takes the ID of a datagram received unsplit, which only moves the blocks forward.
+            void observe(uint16_t dgid);
+
+            // True if the piece with this ID would complete a datagram whose other piece is held.
+            bool completes(uint16_t dgid) const;
+
+            int datagrams_stored() const { return held[0] + held[1]; }
+
+          private:
+            struct piece
+            {
+                std::vector<std::byte> data;
+                uint16_t next_free = NO_PIECE;
+                bool first = false;
+            };
+            static constexpr uint16_t NO_PIECE = 0xffff;
+
+            const int bufsize;
+            const int block_shift;      // log2(bufsize/2)
+            const int nblocks;          // blocks in the 14-bit counter space
+            const int reorder_blocks;   // blocks back from the newest that are held or late
+            std::optional<int> newest;  // newest block, once any datagram has arrived
+            std::array<int, 2> held{0, 0};
+
+            // Indexed by counter % bufsize: 0 if empty, otherwise 1 + an index into `pieces`.
+            // Allocated when the first piece is stored.
+            std::vector<uint16_t> slots;
+            std::vector<piece> pieces;
+            uint16_t free_head = NO_PIECE;
+
+            bool held_block(int block) const;
+            // Moves the newest block forward if `counter` is in a newer one.  Returns false if the
+            // counter is late: older than the held blocks, but within the reorder limit.
+            bool advance(uint16_t counter);
+            void clear_half(int half);
+            uint16_t take_piece();
+            void release_piece(uint16_t index);
         };
 
         enum class size { STANDARD = 0, OVERSIZED = 1 };
@@ -69,6 +91,9 @@ namespace oxen::quic
 
             const ngtcp2_vec* data() const { return bufs.data(); }
             size_t size() const { return bufs_len; }
+
+            // The datagram data being sent, without the dgid prefix.
+            std::span<const uint8_t> payload() const { return {bufs[bufs_len - 1].base, bufs[bufs_len - 1].len}; }
 
             prepared(bool splitting_enabled, uint16_t id, std::span<const std::byte> data);
         };
@@ -282,6 +307,7 @@ namespace oxen::quic
             std::optional<size_t> early_data_head;
             size_t last_i = std::numeric_limits<size_t>::max();
             SendStatus last_sent = SendStatus::Unsent;
+            size_t last_size = 0;
 
             size_t unsent_bytes{0};
 
@@ -330,7 +356,6 @@ namespace oxen::quic
         friend class Connection;
         friend class Loop;
         friend class JobQueue;
-        friend struct dgram::rotating_buffer;
         friend class TestHelper;
 
         Datagrams(
@@ -395,34 +420,6 @@ namespace oxen::quic
         ///
         uint16_t _next_dgram_counter{0};  // The id *before* shifting the split/side bits
 
-        const int rbufsize;
-
-        /// Holds received datagrams in a rotating "tetris" ring-buffer arrangement of split, unmatched packets.
-        /// When a datagram with ID N is recieved, we store it as:
-        ///
-        ///         tetris_buffer[i][j]
-        /// where,
-        ///         i = (N % 4096) / 1024
-        ///         j = N % 1024
-        ///
-        /// When it comes to clearing the buffers, the last cleared row is stored in Connection::_last_cleared.
-        /// The next row to clear is found as:
-        ///
-        ///         to_clear = (i + 2) % 4;
-        ///         if (to_clear == (last_cleared+1)%4)
-        ///         {
-        ///             clear(to_clear)
-        ///             last_cleared = to_clear
-        ///         }
-        ///
-        /// In full, given 'last_cleared' and a target index 'to_clear', we clear 'to_clear' when 'i' is:
-        ///     last_cleared  |  to_clear  |  i
-        /// (init) -1               1         3
-        ///         0               2         0
-        ///         1               3         1
-        ///         2               0         2
-        ///         3               1         3
-        ///
         dgram::rotating_buffer recv_buffer;
 
         std::optional<dgram::prepared> pending(bool prefer_small);
