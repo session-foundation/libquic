@@ -1782,18 +1782,15 @@ namespace oxen::quic
             data = data.subspan(2);
 
             if (dgid % 4 == 0)
-                log::trace(log_cat, "Datagram sent unsplit, bypassing rotating buffer");
+                // Unsplit datagrams also move the reassembly buffer forward, so that it keeps
+                // discarding stale pieces even when split datagrams are rare.
+                dgrams->recv_buffer.observe(dgid);
             else
             {
-                // send received datagram to rotating_buffer if packet_splitting is enabled
+                // The buffer logs why when it has nothing to deliver yet (or ever).
                 maybe_data = dgrams->to_buffer(data, dgid);
-
-                // split datagram did not have a match
-                if (not maybe_data)
-                {
-                    log::trace(log_cat, "Datagram (ID: {}) awaiting counterpart", dgid);
+                if (!maybe_data)
                     return 0;
-                }
             }
         }
 

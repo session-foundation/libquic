@@ -327,7 +327,7 @@ namespace oxen::quic::test
 
         auto server_ci = server_endpoint->get_all_conns(Direction::INBOUND).front();
 
-        REQUIRE(TestHelper::get_datagram_last_cleared(*server_ci->datagrams()) == 0);
+        REQUIRE(TestHelper::get_datagrams_stored(*server_ci->datagrams()) == 0);
     }
 
     TEST_CASE(
@@ -466,7 +466,143 @@ namespace oxen::quic::test
         require_future(data_promise.get_future());
 
         REQUIRE(counter == bufsize);
-        REQUIRE(received == successful_msg);
+        REQUIRE(bytes_diff(received, successful_msg) == "");
+    }
+
+    namespace
+    {
+        uint16_t first_id(int counter)
+        {
+            return static_cast<uint16_t>(counter << 2 | 0b10);
+        }
+        uint16_t second_id(int counter)
+        {
+            return static_cast<uint16_t>(counter << 2 | 0b11);
+        }
+        uint16_t unsplit_id(int counter)
+        {
+            return static_cast<uint16_t>(counter << 2);
+        }
+        std::span<const std::byte> bytes(const std::string& s)
+        {
+            return std::as_bytes(std::span{s});
+        }
+        // Gives the buffer the two pieces of a datagram whose data spells out which pieces they
+        // were, returning the reassembled datagram (if any) as a string.
+        std::optional<std::string> deliver(dgram::rotating_buffer& buf, uint16_t dgid, const std::string& data)
+        {
+            if (auto out = buf.receive(bytes(data), dgid))
+                return std::string{view(*out)};
+            return std::nullopt;
+        }
+    }  // namespace
+
+    TEST_CASE("007 - Datagram support: Reassembly buffer", "[007][datagrams][rotating][reassembly]")
+    {
+        // Blocks of 256: the newest block and the one before it are held, and the two before that
+        // are late.
+        dgram::rotating_buffer buf{512, 1024};
+
+        SECTION("Halves are reassembled in either order")
+        {
+            CHECK_FALSE(deliver(buf, first_id(5), "A5"));
+            CHECK(buf.datagrams_stored() == 1);
+            CHECK(deliver(buf, second_id(5), "a5") == "A5a5");
+            CHECK(buf.datagrams_stored() == 0);
+
+            CHECK_FALSE(deliver(buf, second_id(6), "a6"));
+            CHECK(deliver(buf, first_id(6), "A6") == "A6a6");
+            CHECK(buf.datagrams_stored() == 0);
+        }
+
+        SECTION("A repeated half is dropped rather than paired")
+        {
+            CHECK_FALSE(deliver(buf, first_id(7), "A7"));
+            CHECK_FALSE(deliver(buf, first_id(7), "X7"));
+            CHECK(buf.datagrams_stored() == 1);
+            CHECK(deliver(buf, second_id(7), "a7") == "A7a7");
+        }
+
+        SECTION("A held piece lasts until its block is two blocks old")
+        {
+            // 255 is the last counter of block 0, so this is the shortest it can be held.
+            CHECK_FALSE(deliver(buf, first_id(255), "A255"));
+            buf.observe(unsplit_id(511));
+            CHECK(deliver(buf, second_id(255), "a255") == "A255a255");
+
+            CHECK_FALSE(deliver(buf, first_id(255), "A255"));
+            buf.observe(unsplit_id(512));
+            CHECK(buf.datagrams_stored() == 0);
+            CHECK_FALSE(deliver(buf, second_id(255), "a255"));
+            CHECK(buf.datagrams_stored() == 0);
+        }
+
+        SECTION("A piece at the start of its block is held for up to bufsize-1 newer IDs")
+        {
+            CHECK_FALSE(deliver(buf, first_id(0), "A0"));
+            buf.observe(unsplit_id(511));
+            CHECK(deliver(buf, second_id(0), "a0") == "A0a0");
+        }
+
+        SECTION("Late datagrams are dropped without clearing anything")
+        {
+            buf.observe(unsplit_id(778));  // block 3
+            CHECK_FALSE(deliver(buf, first_id(780), "A780"));
+            CHECK_FALSE(deliver(buf, first_id(300), "A300"));  // block 1: late
+            buf.observe(unsplit_id(10));                       // block 0: late
+            CHECK(buf.datagrams_stored() == 1);
+            CHECK(deliver(buf, second_id(780), "a780") == "A780a780");
+        }
+
+        SECTION("A datagram older than the reorder limit means the IDs jumped forward")
+        {
+            buf.observe(unsplit_id(1024));  // block 4
+            CHECK_FALSE(deliver(buf, first_id(1030), "A1030"));
+            buf.observe(unsplit_id(5));  // block 0: four blocks back, too old to be late
+            CHECK(buf.datagrams_stored() == 0);
+            CHECK_FALSE(deliver(buf, second_id(1030), "a1030"));
+        }
+
+        SECTION("Halves are paired across the counter wrap")
+        {
+            CHECK_FALSE(deliver(buf, first_id(16383), "A16383"));
+            buf.observe(unsplit_id(3));
+            CHECK(deliver(buf, second_id(16383), "a16383") == "A16383a16383");
+        }
+
+        SECTION("A stale piece is not paired with the same ID a wrap later")
+        {
+            CHECK_FALSE(deliver(buf, first_id(5), "A5-old"));
+            // Unsplit datagrams through a whole wrap of the counter, back into block 0.
+            for (int counter = 200; counter < 16384; counter += 200)
+                buf.observe(unsplit_id(counter));
+            buf.observe(unsplit_id(0));
+            CHECK(buf.datagrams_stored() == 0);
+            CHECK_FALSE(deliver(buf, second_id(5), "a5-new"));
+            CHECK(deliver(buf, first_id(5), "A5-new") == "A5-newa5-new");
+        }
+
+        SECTION("Without a late range, anything older than the held blocks is a forward jump")
+        {
+            dgram::rotating_buffer strict{512, 512};
+            strict.observe(unsplit_id(600));  // block 2
+            CHECK_FALSE(deliver(strict, first_id(610), "A610"));
+            strict.observe(unsplit_id(10));  // block 0
+            CHECK(strict.datagrams_stored() == 0);
+        }
+    }
+
+    TEST_CASE("007 - Datagram support: Reassembly buffer options", "[007][datagrams][rotating][types]")
+    {
+        CHECK_THROWS(opt::enable_datagrams{Splitting::ACTIVE, 32});
+        CHECK_THROWS(opt::enable_datagrams{Splitting::ACTIVE, 768});
+        CHECK_THROWS(opt::enable_datagrams{Splitting::ACTIVE, 16384});
+        CHECK_NOTHROW(opt::enable_datagrams{Splitting::ACTIVE, 8192});
+
+        opt::enable_datagrams dgrams{Splitting::ACTIVE, 512};
+        CHECK_THROWS(dgrams.reorder_limit(256));
+        CHECK_THROWS(dgrams.reorder_limit(8193));
+        CHECK_NOTHROW(dgrams.reorder_limit(768));
     }
 
     /*
@@ -696,6 +832,104 @@ namespace oxen::quic::test
                 test_net.loop()->call_get([&] { return TestHelper::get_dgram_drop_count(*conn_interface->datagrams()); });
 
         REQUIRE(drop_count_2 > drop_count);
+    }
+
+    TEST_CASE("007 - Datagram support: Dropped unsendable datagrams leave the queue limit", "[007][datagrams][queue_limit]")
+    {
+        // The queue limit is enforced against pending_bytes(), so any bytes that a drop fails to
+        // release would count against the limit for the rest of the connection.
+        dgram::queue q{true};
+        std::vector<std::byte> big(2000), small(100);
+        q.emplace(big, 1 << 2, nullptr);
+        q.emplace(big, 2 << 2, nullptr);
+        q.emplace(small, 3 << 2, nullptr);
+        REQUIRE(q.pending_bytes() == 4100);
+
+        // Simulates a PMTU decrease: two 900-byte pieces can't carry the big ones any more.
+        auto d = q.fetch(900, false);
+        REQUIRE(d);
+        CHECK(d->id == 3 << 2);
+        CHECK(q.pending_bytes() == 100);
+
+        q.confirm_sent();
+        CHECK(q.empty());
+        CHECK(q.pending_bytes() == 0);
+    }
+
+    TEST_CASE("007 - Datagram support: Pending bytes count only unsent split pieces", "[007][datagrams][queue_limit]")
+    {
+        dgram::queue q{true};
+        std::vector<std::byte> payload(2000);
+        q.emplace(payload, 1 << 2, nullptr);
+        q.emplace(payload, 2 << 2, nullptr);
+        REQUIRE(q.pending_bytes() == 4000);
+
+        auto send = [&q](bool prefer_small) {
+            auto d = q.fetch(1200, prefer_small);
+            REQUIRE(d);
+            q.confirm_sent();
+            return d->id;
+        };
+
+        // Small pieces first: the head's, then the lookahead's.
+        CHECK(send(true) == ((1 << 2) | 0b11));
+        CHECK(q.pending_bytes() == 3200);
+        CHECK(send(true) == ((2 << 2) | 0b11));
+        CHECK(q.pending_bytes() == 2400);
+
+        CHECK(send(false) == ((1 << 2) | 0b10));
+        CHECK(q.pending_bytes() == 1200);
+        CHECK(send(false) == ((2 << 2) | 0b10));
+        CHECK(q.pending_bytes() == 0);
+        CHECK(q.empty());
+    }
+
+    TEST_CASE("007 - Datagram support: Pending bytes across 0-RTT", "[007][datagrams][queue_limit][0rtt]")
+    {
+        dgram::queue q{true};
+        q.early_data_begin();
+        std::vector<std::byte> big(2000), small(100);
+        q.emplace(big, 1 << 2, nullptr);
+        q.emplace(small, 2 << 2, nullptr);
+        q.emplace(small, 3 << 2, nullptr);
+        REQUIRE(q.pending_bytes() == 2200);
+
+        auto send = [&q] {
+            auto d = q.fetch(1200, false);
+            REQUIRE(d);
+            q.confirm_sent();
+        };
+
+        // The big one goes out in two pieces, then the first small one goes out whole.
+        send();
+        CHECK(q.pending_bytes() == 1000);
+        send();
+        CHECK(q.pending_bytes() == 200);
+        send();
+        CHECK(q.pending_bytes() == 100);
+
+        SECTION("accepted")
+        {
+            q.early_data_end(true);
+            CHECK(q.size() == 1);
+            CHECK(q.pending_bytes() == 100);
+        }
+        SECTION("rejected")
+        {
+            q.early_data_end(false);
+            CHECK(q.size() == 3);
+            CHECK(q.pending_bytes() == 2200);
+        }
+        SECTION("retried with a piece in flight")
+        {
+            q.emplace(big, 4 << 2, nullptr);
+            send();  // the last small one
+            send();  // first piece of the new big one
+            CHECK(q.pending_bytes() == 800);
+            q.early_data_retry();
+            CHECK(q.size() == 4);
+            CHECK(q.pending_bytes() == 4200);
+        }
     }
 
     TEST_CASE("007 - Datagram support: queued datagram discarded with its channel", "[007][datagrams][destruction]")
