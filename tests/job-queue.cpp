@@ -1,7 +1,10 @@
 #include "unit_test.hpp"
 #include "utils.hpp"
 
+#include <atomic>
+#include <memory>
 #include <mutex>
+#include <thread>
 
 #ifndef _WIN32
 extern "C"
@@ -117,6 +120,56 @@ namespace oxen::quic::test
 
             CHECK_NOFAIL(success);
         }
+    }
+
+    TEST_CASE("JobQueue - posts from another thread racing a stop", "[jobqueue]")
+    {
+        // A post passes the stopped check and then wakes the queue; stop() frees the waker on the
+        // loop thread.  The wake has to land before the free, or it reaches freed memory, which a
+        // macOS build shows as an occasional crash in event_active and a Linux one, without a
+        // sanitiser, does not show at all.  The window is a few instructions wide, so a plain or
+        // ASan build rarely hits it; TSan reports the unsynchronised read and free on every run.
+        Loop loop;
+        for (int round = 0; round < 500; round++)
+        {
+            auto jq = std::make_unique<JobQueue>(loop);
+            std::atomic<bool> posting{true};
+            std::thread poster{[&] {
+                while (posting)
+                {
+                    try
+                    {
+                        jq->call_soon([] {});
+                    }
+                    catch (const std::runtime_error&)
+                    {
+                        break;  // stopped: what a post after the stop is meant to get
+                    }
+                }
+            }};
+            jq->stop();
+            posting = false;
+            poster.join();
+        }
+        SUCCEED("no post reached a freed waker");
+    }
+
+    TEST_CASE("JobQueue - is_running says whether it has been stopped", "[jobqueue]")
+    {
+        Loop loop;
+        JobQueue jq{loop};
+
+        REQUIRE(jq.is_running());
+        REQUIRE(loop.call_get([&] { return jq.is_running(); }));
+
+        jq.stop();
+        REQUIRE_FALSE(jq.is_running());
+        REQUIRE_FALSE(loop.call_get([&] { return jq.is_running(); }));
+        REQUIRE_THROWS_AS(jq.call_soon([] {}), std::runtime_error);
+
+        // Stopping again is a no-op, and does not bring it back.
+        jq.stop();
+        REQUIRE_FALSE(jq.is_running());
     }
 
 }  // namespace oxen::quic::test
