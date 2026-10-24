@@ -44,6 +44,9 @@ if(LIBQUIC_BUILD_TESTS)
         016-stateless_reset.cpp
         017-stream-stats.cpp
         018-unencrypted.cpp
+        019-socket-buffers.cpp
+        020-congestion-control.cpp
+        021-flow-control.cpp
         job-queue.cpp
 
         case_logger.cpp

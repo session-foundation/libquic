@@ -116,6 +116,11 @@ namespace oxen::quic
         _allow_gro = true;
     }
 
+    void Endpoint::handle_ep_opt(opt::socket_buffers sb)
+    {
+        _socket_buffers = sb;
+    }
+
     ConnectionID Endpoint::next_reference_id()
     {
         log::trace(log_cat, "{} called", __PRETTY_FUNCTION__);
@@ -160,7 +165,11 @@ namespace oxen::quic
             socket = std::make_unique<UDPSocket>(
                     loop.get_event_base(),
                     _local,
-                    UDPSocket::options{.allow_gso = _allow_gso, .allow_gro = _allow_gro},
+                    UDPSocket::options{
+                            .allow_gso = _allow_gso,
+                            .allow_gro = _allow_gro,
+                            .recv_buffer = _socket_buffers.recv,
+                            .send_buffer = _socket_buffers.send},
                     [this](Packet&& packet) { handle_packet(std::move(packet)); });
 
             _local = socket->address();
