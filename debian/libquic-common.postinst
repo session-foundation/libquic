@@ -1,0 +1,24 @@
+#!/bin/sh
+
+set -e
+
+# Only on first install: an upgrade must not reapply our values over whatever
+# the admin has since set at runtime.  A later version that changes the values
+# can check the version being upgraded from.
+#
+# procps sysctl rather than systemd-sysctl so that this works without systemd
+# and without caring whether the binary is under /lib or /usr/lib.  --system
+# reads every sysctl.d file in the usual precedence order, so an admin
+# override of either kind wins; --pattern limits it to our two keys.  procps
+# 3.x matches the pattern against the bare key and 4.x against the whole
+# "key = value" line, hence the ending of the regex.
+#
+# Writing these fails in unprivileged containers, which must not break the
+# install.
+if [ "$1" = configure ] && [ -z "$2" ] && command -v sysctl >/dev/null 2>&1; then
+    sysctl -q --system --pattern '^-?net[./]core[./][rw]mem_max([[:space:]]*=|$)' >/dev/null 2>&1 || true
+fi
+
+#DEBHELPER#
+
+exit 0

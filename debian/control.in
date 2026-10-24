@@ -38,6 +38,7 @@ Description: C++ library for multi-stream QUIC implementations (headers)
 Package: liboxen-quic@LIB_VERSION@
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends},
+    libquic-common (>= ${source:Version}),
     libngtcp2-16 (>= ${ngtcp2:Version}),
     libngtcp2-crypto-gnutls8 (>= ${ngtcp2:Version})
 Description: C++ library for multi-stream QUIC implementations
@@ -46,6 +47,19 @@ Description: C++ library for multi-stream QUIC implementations
  .
  This package contains the library file needed by software built using
  oxen-libquic.
+
+Package: libquic-common
+Section: net
+Architecture: all
+Depends: ${misc:Depends}
+Description: C++ library for multi-stream QUIC implementations (system settings)
+ This C++20 library builds upon ngtcp2 to provide a C++ interface to making and
+ accepting QUIC connections.
+ .
+ This package contains the kernel (sysctl) settings that servers using libquic
+ need: it raises the maximum UDP socket buffer sizes that unprivileged
+ processes may request, which libquic uses to avoid dropping packets under
+ load.  It is shared by all versions of the libquic library package.
 
 Package: oxen-quic-tools
 Architecture: any
