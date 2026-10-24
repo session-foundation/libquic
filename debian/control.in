@@ -36,7 +36,7 @@ Description: C++ library for multi-stream QUIC implementations (headers)
 Package: liboxen-quic@LIB_VERSION@
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends},
-    libquic-common (>= ${source:Version}),
+    liboxen-quic-common (>= ${source:Version}),
     libngtcp2-16 (>= ${ngtcp2:Version}),
     libngtcp2-crypto-gnutls8 (>= ${ngtcp2:Version})
 Description: C++ library for multi-stream QUIC implementations
@@ -46,7 +46,7 @@ Description: C++ library for multi-stream QUIC implementations
  This package contains the library file needed by software built using
  oxen-libquic.
 
-Package: libquic-common
+Package: liboxen-quic-common
 Section: net
 Architecture: all
 Depends: ${misc:Depends}
