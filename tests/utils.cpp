@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <stdexcept>
 #include <type_traits>
 
@@ -362,11 +363,11 @@ namespace oxen::quic
         if (level.empty())
             level = "warning";
 
-        cli.add_option("-l,--log-file", file, "Log output filename, or one of stdout/-/stderr/syslog.")
+        cli.add_option("--log-file", file, "Log output filename, or one of stdout/-/stderr/syslog.")
                 ->type_name("FILE")
                 ->capture_default_str();
 
-        cli.add_option("-L,--log-level", level, "Log verbosity level; one of trace, debug, info, warn, error, critical, off")
+        cli.add_option("-l,--log-level", level, "Log verbosity level; one of trace, debug, info, warn, error, critical, off")
                 ->type_name("LEVEL")
                 ->capture_default_str();
     }
@@ -378,7 +379,7 @@ namespace oxen::quic
         enable_0rtt = false;
         disable_pmtud = false;
 
-        cli.add_option("--listen", server_listen, "Server address to listen on")
+        cli.add_option("-L,--listen", server_listen, "Server address to listen on")
                 ->type_name("IP:PORT")
                 ->capture_default_str();
 
@@ -430,7 +431,7 @@ namespace oxen::quic
                     throw CLI::ValidationError{
                             "Invalid value passed to --remote-pubkey: expected value encoded as hex or base64"};
                 });
-        rem_pubkey->add_option("--remote-seed", remote_pubkey, "Calculate server pubkey using this server seed value")
+        rem_pubkey->add_option("-r,--remote-seed", remote_pubkey, "Calculate server pubkey using this server seed value")
                 ->transform([](const std::string& val) { return generate_ed25519(val).second; });
         rem_pubkey->require_option(1);
 
@@ -442,13 +443,59 @@ namespace oxen::quic
                 disable_pmtud,
                 "Disable path MTU discovery, forcing all outgoing packets to be the minimum size (1200 bytes).");
 
-        cli.add_option("--local", local_addr, "Local bind address (optional)")->type_name("IP:PORT")->capture_default_str();
+        cli.add_option("-L,--local", local_addr, "Local bind address (optional)")
+                ->type_name("IP:PORT")
+                ->capture_default_str();
 
         cli.add_option(
                 "-s,--seed",
                 seed_string,
                 "If non-empty then the client key and endpoint private data will be generated from a hash of the given "
                 "seed, for reproducible keys and operation.  If omitted/empty a random seed is used.");
+    }
+
+    std::string_view congestion_control_name(opt::congestion_control cc)
+    {
+        switch (cc)
+        {
+            case opt::congestion_control::bbr:
+                return "bbr";
+            case opt::congestion_control::cubic:
+                return "cubic";
+            case opt::congestion_control::reno:
+                return "reno";
+        }
+        return "unknown";
+    }
+
+    void add_congestion_control_opt(CLI::App& cli, opt::congestion_control& cc)
+    {
+        std::map<std::string, opt::congestion_control> algos;
+        for (auto a : {opt::congestion_control::bbr, opt::congestion_control::cubic, opt::congestion_control::reno})
+            algos.emplace(congestion_control_name(a), a);
+
+        cli.add_option("-C,--congestion-control", cc, "Congestion control algorithm for connections: bbr, cubic, or reno")
+                ->transform(CLI::CheckedTransformer(algos, CLI::ignore_case).description(""))
+                ->type_name("ALGO")
+                ->default_str(std::string{congestion_control_name(cc)});
+    }
+
+    void add_socket_buffer_opts(CLI::App& cli, opt::socket_buffers& bufs)
+    {
+        cli.add_option(
+                   "--udp-recv-buffer",
+                   bufs.recv,
+                   "UDP socket receive buffer size to request, such as 4M or 512KiB; 0 leaves the OS default")
+                ->transform(CLI::AsSizeValue(false).description(""))
+                ->type_name("SIZE")
+                ->default_str("{}MiB"_format(DEFAULT_SOCKET_RECV_BUFFER / 1_Mi));
+        cli.add_option(
+                   "--udp-send-buffer",
+                   bufs.send,
+                   "UDP socket send buffer size to request, such as 1M or 512KiB; 0 leaves the OS default")
+                ->transform(CLI::AsSizeValue(false).description(""))
+                ->type_name("SIZE")
+                ->default_str("OS default");
     }
 
     void server_log_listening(
@@ -472,7 +519,7 @@ namespace oxen::quic
                                          std::string::npos
                                ? "'"sv
                                : ""sv;
-            flags[1].push_back("--remote-seed {0}{1}{0}"_format(quote, seed_string));
+            flags[1].push_back("-r {0}{1}{0}"_format(quote, seed_string));
         }
 
         for (auto& f : flags)

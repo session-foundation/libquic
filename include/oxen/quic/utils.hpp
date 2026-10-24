@@ -38,43 +38,54 @@ namespace oxen::quic
 
     // SI (1000) and non-SI (1024-based) modifier prefix operators.  E.g.
     // 50_M is 50'000'000 and 50_Mi is 52'428'800.
-    constexpr unsigned long long operator""_k(unsigned long long int x)
+    //
+    // Code outside oxen::quic can use just these with `using namespace oxen::quic::literals;`.
+    inline namespace literals
     {
-        return x * 1000;
-    }
-    constexpr unsigned long long operator""_M(unsigned long long int x)
-    {
-        return x * 1000 * 1_k;
-    }
-    constexpr unsigned long long operator""_G(unsigned long long int x)
-    {
-        return x * 1000 * 1_M;
-    }
-    constexpr unsigned long long operator""_T(unsigned long long int x)
-    {
-        return x * 1000 * 1_G;
-    }
-    constexpr unsigned long long operator""_ki(unsigned long long int x)
-    {
-        return x * 1024;
-    }
-    constexpr unsigned long long operator""_Mi(unsigned long long int x)
-    {
-        return x * 1024 * 1_ki;
-    }
-    constexpr unsigned long long operator""_Gi(unsigned long long int x)
-    {
-        return x * 1024 * 1_Mi;
-    }
-    constexpr unsigned long long operator""_Ti(unsigned long long int x)
-    {
-        return x * 1024 * 1_Gi;
-    }
+        constexpr unsigned long long operator""_k(unsigned long long x)
+        {
+            return x * 1000;
+        }
+        constexpr unsigned long long operator""_M(unsigned long long x)
+        {
+            return x * 1000 * 1_k;
+        }
+        constexpr unsigned long long operator""_G(unsigned long long x)
+        {
+            return x * 1000 * 1_M;
+        }
+        constexpr unsigned long long operator""_T(unsigned long long x)
+        {
+            return x * 1000 * 1_G;
+        }
+        constexpr unsigned long long operator""_ki(unsigned long long x)
+        {
+            return x * 1024;
+        }
+        constexpr unsigned long long operator""_Mi(unsigned long long x)
+        {
+            return x * 1024 * 1_ki;
+        }
+        constexpr unsigned long long operator""_Gi(unsigned long long x)
+        {
+            return x * 1024 * 1_Mi;
+        }
+        constexpr unsigned long long operator""_Ti(unsigned long long x)
+        {
+            return x * 1024 * 1_Gi;
+        }
+    }  // namespace literals
 
     inline constexpr uint64_t DEFAULT_MAX_BIDI_STREAMS = 32;
 
     inline constexpr std::chrono::seconds DEFAULT_HANDSHAKE_TIMEOUT = 10s;
     inline constexpr std::chrono::seconds DEFAULT_IDLE_TIMEOUT = 30s;
+
+    // Flow control window defaults; see opt::flow_control.
+    inline constexpr uint64_t DEFAULT_INITIAL_CONN_WINDOW = 15_Mi;
+    inline constexpr uint64_t DEFAULT_MAX_CONN_WINDOW = 24_Mi;
+    inline constexpr uint64_t DEFAULT_INITIAL_STREAM_WINDOW = 6_Mi;
+    inline constexpr uint64_t DEFAULT_MAX_STREAM_WINDOW = 16_Mi;
 
     // NGTCP2 sets the path_pmtud_payload to 1200 on connection creation, then discovers upwards
     // to at most MAX_PMTUD_UDP_PAYLOAD. In 'lazy' mode, we take in split packets under the current
@@ -157,6 +168,10 @@ namespace oxen::quic
     // loop starvation in the face of heavy incoming packets.)  recvmmsg receives up to this many in
     // a single call.
     inline constexpr size_t MAX_RECEIVE_PER_LOOP = 64;
+
+    // The UDP socket receive buffer size requested by default (the send buffer is left at the OS
+    // default); see opt::socket_buffers.
+    inline constexpr size_t DEFAULT_SOCKET_RECV_BUFFER = 4_Mi;
 
     // The minimum size stateless reset packet we will send, as proscribed by section 10.3.3 of the
     // RFC.  Each generated stateless reset packet is smaller than the one that triggered it, down

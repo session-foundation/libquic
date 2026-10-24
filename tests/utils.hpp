@@ -239,6 +239,15 @@ namespace oxen::quic
             bool& enable_0rtt,
             std::filesystem::path& store_0rtt);
 
+    // Adds a -C/--congestion-control option selecting bbr (the default), cubic, or reno.
+    void add_congestion_control_opt(CLI::App& cli, opt::congestion_control& cc);
+
+    std::string_view congestion_control_name(opt::congestion_control cc);
+
+    // Adds --udp-recv-buffer and --udp-send-buffer options taking sizes such as 4M or 512KiB for
+    // opt::socket_buffers; left unset, libquic's defaults apply, and 0 leaves the OS default.
+    void add_socket_buffer_opts(CLI::App& cli, opt::socket_buffers& bufs);
+
     void setup_logging(std::string out, const std::string& level);
 
     void server_log_listening(
