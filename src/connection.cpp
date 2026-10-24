@@ -2051,10 +2051,22 @@ namespace oxen::quic
 #ifndef NDEBUG
         settings.log_printf = log_printer;
 #endif
-        settings.cc_algo = NGTCP2_CC_ALGO_BBR;
+        switch (context->config.congestion_control)
+        {
+            case opt::congestion_control::bbr:
+                settings.cc_algo = NGTCP2_CC_ALGO_BBR;
+                break;
+            case opt::congestion_control::cubic:
+                settings.cc_algo = NGTCP2_CC_ALGO_CUBIC;
+                break;
+            case opt::congestion_control::reno:
+                settings.cc_algo = NGTCP2_CC_ALGO_RENO;
+                break;
+        }
         settings.initial_rtt = NGTCP2_DEFAULT_INITIAL_RTT;
-        settings.max_window = 24_Mi;
-        settings.max_stream_window = 16_Mi;
+        const auto& fc = context->config.flow_control;
+        settings.max_window = fc.max_conn_window.value_or(DEFAULT_MAX_CONN_WINDOW);
+        settings.max_stream_window = fc.max_stream_window.value_or(DEFAULT_MAX_STREAM_WINDOW);
         settings.handshake_timeout = handshake_timeout <= 0s ? UINT64_MAX : static_cast<uint64_t>(handshake_timeout.count());
 
         std::span<const uint16_t> probes = DEFAULT_PMTUD_PROBES;
@@ -2084,17 +2096,17 @@ namespace oxen::quic
         // cap as well.
         params.max_udp_payload_size = max_payload;
 
-        // Connection flow level control window
-        params.initial_max_data = 15_Mi;
+        params.initial_max_data = fc.initial_conn_window.value_or(DEFAULT_INITIAL_CONN_WINDOW);
         // Max concurrent streams supported on one connection
         params.initial_max_streams_uni = 0;
         // Max amount of data the remote is initially allowed to send on a stream (local = streams
         // we initiate, remote = streams initiated to us).  Normally, i.e. when the stream is not
         // paused, we immediately extend the stream window by however many bytes we receive as we
         // receive stream data.
-        params.initial_max_stream_data_bidi_local = 6_Mi;
-        params.initial_max_stream_data_bidi_remote = 6_Mi;
-        params.initial_max_stream_data_uni = 6_Mi;
+        const auto stream_window = fc.initial_stream_window.value_or(DEFAULT_INITIAL_STREAM_WINDOW);
+        params.initial_max_stream_data_bidi_local = stream_window;
+        params.initial_max_stream_data_bidi_remote = stream_window;
+        params.initial_max_stream_data_uni = stream_window;
         params.max_idle_timeout = std::chrono::nanoseconds{context->config.idle_timeout}.count();
         params.active_connection_id_limit = MAX_ACTIVE_CIDS;
 
