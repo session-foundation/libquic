@@ -83,6 +83,7 @@ ping_stats run_ping_client(
         const std::shared_ptr<Endpoint>& endpoint,
         const std::shared_ptr<GNUTLSCreds>& creds,
         const RemoteAddress& raddr,
+        opt::congestion_control cc,
         uint32_t ping_count,
         double ping_interval,
         double ping_timeout,
@@ -127,6 +128,12 @@ int main(int argc, char* argv[])
     cli.add_flag("--gso", gso, "Send with GSO, if libquic was built with it and the OS supports it.");
     cli.add_flag("--gro", gro, "Receive with GRO, if libquic was built with it and the OS supports it.");
     cli.add_flag_callback("-G", [&] { gso = gro = true; }, "Same as --gso --gro.");
+
+    auto cc = opt::congestion_control::bbr;
+    add_congestion_control_opt(cli, cc);
+
+    opt::socket_buffers socket_buffers;
+    add_socket_buffer_opts(cli, socket_buffers);
 
     size_t chunk_size = 64_ki, chunk_num = 2;
     cli.add_option("--stream-chunk-size", chunk_size, "How much data to queue at once, per chunk");
@@ -175,7 +182,7 @@ int main(int argc, char* argv[])
 
     bool ping_reconnect = false;
     cli.add_flag(
-            "-r,--ping-reconnect",
+            "--ping-reconnect",
             ping_reconnect,
             "Automatically reconnect upon connection closing (such as from interruption) when running in ping mode.  "
             "Without this option a connection close for any reason terminates the ping.");
@@ -318,12 +325,13 @@ int main(int argc, char* argv[])
             mtu,
             allow_gso,
             allow_gro,
+            socket_buffers,
             opt::enable_datagrams{Splitting::ACTIVE}.queue_limit(size + 64_ki));
     std::shared_ptr<Connection> client_ci;
     if (!ping)
     {
-        log::info(SPEEDTEST, "Connecting to {}...", server_addr);
-        client_ci = client->connect(server_addr, client_tls, on_stream_data, stream_closed);
+        log::info(SPEEDTEST, "Connecting to {} using {} congestion control...", server_addr, congestion_control_name(cc));
+        client_ci = client->connect(server_addr, client_tls, on_stream_data, stream_closed, cc);
         client_ci->set_split_datagram_lookahead(lookahead);
     }
 
@@ -493,6 +501,7 @@ int main(int argc, char* argv[])
                 client,
                 client_tls,
                 server_addr,
+                cc,
                 ping_count,
                 ping_interval,
                 ping_timeout,
@@ -538,6 +547,7 @@ ping_stats run_ping_client(
         const std::shared_ptr<Endpoint>& client,
         const std::shared_ptr<GNUTLSCreds>& creds,
         const RemoteAddress& raddr,
+        opt::congestion_control cc,
         uint32_t ping_count,
         double ping_interval_d,
         double ping_timeout,
@@ -602,7 +612,7 @@ ping_stats run_ping_client(
         }
     };
 
-    log::info(SPEEDTEST, "Connecting to {}...", raddr);
+    log::info(SPEEDTEST, "Connecting to {} using {} congestion control...", raddr, congestion_control_name(cc));
 
     std::shared_ptr<Connection> client_conn;
     std::shared_ptr<Datagrams> client_dg;
@@ -679,7 +689,7 @@ ping_stats run_ping_client(
         }
         last_start = started;
         all_done.emplace();
-        client_conn = client->connect(raddr, dgram_recv, creds, conn_established, conn_closed);
+        client_conn = client->connect(raddr, dgram_recv, creds, conn_established, conn_closed, cc);
         client_dg.reset();
 
         send_ping();
