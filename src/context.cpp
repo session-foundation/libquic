@@ -48,6 +48,23 @@ namespace oxen::quic
         log::trace(log_cat, "User passed connection handshake_timeout config value: {}", config.handshake_timeout->count());
     }
 
+    void IOContext::handle_ioctx_opt(opt::congestion_control cc)
+    {
+        config.congestion_control = cc;
+    }
+
+    void IOContext::handle_ioctx_opt(opt::flow_control fc)
+    {
+        // ngtcp2 asserts that these fit in a QUIC varint.
+        constexpr uint64_t max_window = (uint64_t{1} << 62) - 1;
+        for (auto w : {fc.initial_conn_window, fc.max_conn_window, fc.initial_stream_window, fc.max_stream_window})
+            if (w && *w > max_window)
+                throw std::invalid_argument{"opt::flow_control windows must be at most 2^62-1"};
+        if (fc.initial_conn_window == 0u || fc.initial_stream_window == 0u)
+            throw std::invalid_argument{"opt::flow_control initial windows must be at least 1"};
+        config.flow_control = fc;
+    }
+
     void IOContext::handle_ioctx_opt(opt::outbound_alpns alpns)
     {
         config.out_alpns.emplace(std::move(alpns));

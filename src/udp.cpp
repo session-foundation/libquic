@@ -30,11 +30,14 @@ extern "C"
 
 #include <event2/event.h>
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -289,6 +292,124 @@ namespace oxen::quic
 #endif
     }
 
+#ifdef __linux__
+    // Linux doubles a requested socket buffer size (after capping it) to allow for its bookkeeping,
+    // and getsockopt reports the doubled size.
+    constexpr int SOCKET_BUFFER_SCALE = 2;
+#else
+    constexpr int SOCKET_BUFFER_SCALE = 1;
+#endif
+
+    static std::error_code last_socket_error()
+    {
+#ifdef _WIN32
+        return {WSAGetLastError(), std::system_category()};
+#else
+        return {errno, std::system_category()};
+#endif
+    }
+
+    // Requests a `size`-byte buffer for `optname` (SO_RCVBUF or SO_SNDBUF), unless size is 0, and
+    // logs what the socket ends up with.  `user_requested` is false for libquic's own default size,
+    // which only ever enlarges the buffer.  Never throws: a smaller buffer than requested only means
+    // more packet drops under load.
+    static void set_buffer_size(UDPSocket::socket_t sock, int optname, size_t size, bool user_requested)
+    {
+        if (size == 0)
+            return;
+
+        const bool recv = optname == SO_RCVBUF;
+        const std::string_view dir = recv ? "receive" : "send";
+
+        auto get = [&]() -> int {
+            int v = 0;
+#ifdef _WIN32
+            int len = sizeof(v);
+            auto* p = reinterpret_cast<char*>(&v);
+#else
+            socklen_t len = sizeof(v);
+            auto* p = &v;
+#endif
+            return getsockopt(sock, SOL_SOCKET, optname, p, &len) == 0 ? v : 0;
+        };
+        auto set = [&](int v) {
+#ifdef _WIN32
+            const auto* p = reinterpret_cast<const char*>(&v);
+#else
+            const auto* p = &v;
+#endif
+            return setsockopt(sock, SOL_SOCKET, optname, p, sizeof(v)) == 0;
+        };
+
+        // Linux caps anything larger here anyway, so that the doubled size still fits in an int.
+        const int requested = static_cast<int>(std::min<size_t>(size, std::numeric_limits<int>::max() / 2));
+        const int64_t expected = int64_t{requested} * SOCKET_BUFFER_SCALE;
+
+        // libquic's default mustn't shrink an OS default that is already larger (e.g. from a raised
+        // net.core.rmem_default), but a size the application gave is applied even if it shrinks it.
+        const int before = get();
+        if (!user_requested && before >= expected)
+        {
+            log::debug(log_cat, "UDP socket {} buffer is already {} bytes; leaving it", dir, before);
+            return;
+        }
+
+        int request = requested;
+        while (!set(request))
+        {
+            auto err = last_socket_error();
+            if (err != std::errc::no_buffer_space)
+            {
+                log::warning(log_cat, "Unable to set UDP socket {} buffer size to {}: {}", dir, requested, err.message());
+                return;
+            }
+            // macOS and the BSDs refuse a size above their limit, leaving the buffer as it was, so
+            // step down until they accept one; for libquic's default, only while it would still be
+            // larger than what the socket already has.
+            request /= 2;
+            if (request == 0 || (!user_requested && int64_t{request} * SOCKET_BUFFER_SCALE <= before))
+                break;
+        }
+
+        const int got = get();
+        if (got >= expected)
+        {
+            log::debug(log_cat, "UDP socket {} buffer is {} bytes", dir, got);
+            return;
+        }
+
+        // Every client on a stock system would otherwise warn about limits on libquic's default that
+        // it can do nothing about.
+        const auto level = user_requested ? log::Level::warn : log::Level::debug;
+#if defined(__linux__)
+        log::log(
+                log_cat,
+                level,
+                "UDP socket {} buffer is {} bytes rather than {} (double the {} requested); raise the {} sysctl to at "
+                "least {} to allow it",
+                dir,
+                got,
+                expected,
+                requested,
+                recv ? "net.core.rmem_max" : "net.core.wmem_max",
+                requested);
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__DragonFly__)
+        // These allow buffers of up to kern.ipc.maxsockbuf * MCLBYTES / (MSIZE + MCLBYTES), i.e. 8/9
+        // of it.
+        log::log(
+                log_cat,
+                level,
+                "UDP socket {} buffer is {} bytes rather than the {} requested; raise the kern.ipc.maxsockbuf sysctl "
+                "to at least {} to allow it",
+                dir,
+                got,
+                requested,
+                (int64_t{requested} * 9 + 7) / 8);
+#else
+        log::log(log_cat, level, "UDP socket {} buffer is {} bytes rather than the {} requested", dir, got, requested);
+#endif
+    }
+
 #ifdef _WIN32
     std::mutex get_wsa_mutex;
     LPFN_WSASENDMSG WSASendMsg = nullptr;
@@ -429,6 +550,10 @@ namespace oxen::quic
         }
 
         set_dont_fragment(sock_, addr.is_ipv6(), addr.dual_stack);
+
+        set_buffer_size(
+                sock_, SO_RCVBUF, opts.recv_buffer.value_or(DEFAULT_SOCKET_RECV_BUFFER), opts.recv_buffer.has_value());
+        set_buffer_size(sock_, SO_SNDBUF, opts.send_buffer.value_or(0), opts.send_buffer.has_value());
 
         // Enable ECN notification on packets we receive:
 #ifndef _WIN32

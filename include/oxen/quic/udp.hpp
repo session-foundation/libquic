@@ -93,7 +93,7 @@ namespace oxen::quic
 
         UDPSocket() = delete;
 
-        /// Optional socket features, off by default.
+        /// Optional socket settings.
         struct options
         {
             /// Send runs of packets as single GSO messages, where libquic was built with GSO
@@ -101,6 +101,11 @@ namespace oxen::quic
             bool allow_gso = false;
             /// Receive with UDP GRO, where libquic was built with recvmmsg and the OS supports it.
             bool allow_gro = false;
+            /// The receive and send buffer sizes to request: nullopt for libquic's default, 0 to
+            /// leave the OS default.  See opt::socket_buffers for how they are applied.  Failing to
+            /// get them is logged, never thrown.
+            std::optional<size_t> recv_buffer = std::nullopt;
+            std::optional<size_t> send_buffer = std::nullopt;
         };
 
         /// Constructs a UDP socket bound to the given address.  Throws if binding fails.  If

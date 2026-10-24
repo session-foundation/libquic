@@ -41,6 +41,12 @@ int main(int argc, char* argv[])
     cli.add_flag("--gro", gro, "Receive with GRO, if libquic was built with it and the OS supports it.");
     cli.add_flag_callback("-G", [&] { gso = gro = true; }, "Same as --gso --gro.");
 
+    auto cc = opt::congestion_control::bbr;
+    add_congestion_control_opt(cli, cc);
+
+    opt::socket_buffers socket_buffers;
+    add_socket_buffer_opts(cli, socket_buffers);
+
     try
     {
         cli.parse(argc, argv);
@@ -320,8 +326,9 @@ int main(int argc, char* argv[])
                 mtu,
                 allow_gso,
                 allow_gro,
+                socket_buffers,
                 opt::enable_datagrams{Splitting::ACTIVE});
-        server->listen(server_tls, stream_opened, stream_data, recv_dgram_cb);
+        server->listen(server_tls, stream_opened, stream_data, recv_dgram_cb, cc);
     }
     catch (const std::exception& e)
     {
@@ -329,6 +336,7 @@ int main(int argc, char* argv[])
         return 1;
     }
 
+    log::info(SPEEDTEST, "Using {} congestion control", congestion_control_name(cc));
     server_log_listening(server_local, DEFAULT_SPEEDTEST_ADDR, pubkey, seed_string, enable_0rtt);
 
     for (;;)
