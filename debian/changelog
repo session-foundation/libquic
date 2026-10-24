@@ -1,3 +1,9 @@
+oxen-libquic (1.13.0~rc1-2~ubuntu2404) noble; urgency=medium
+
+  * Rename libquic-common to liboxen-quic-common
+
+ -- Jason Rhinelander <jason@session.foundation>  Sat, 24 Oct 2026 17:25:50 -0300
+
 oxen-libquic (1.13.0~rc1-1~ubuntu2404) noble; urgency=medium
 
   * Request larger UDP socket buffers
