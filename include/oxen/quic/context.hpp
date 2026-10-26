@@ -27,6 +27,8 @@ namespace oxen::quic
         std::optional<std::chrono::nanoseconds> handshake_timeout{std::nullopt};
         // idle timeout
         std::chrono::milliseconds idle_timeout{DEFAULT_IDLE_TIMEOUT};
+        opt::congestion_control congestion_control{opt::congestion_control::cubic};
+        opt::flow_control flow_control{};
         // datagram support
         bool datagram_support{false};
         size_t dgram_queue_limit{std::numeric_limits<size_t>::max()};
@@ -71,6 +73,8 @@ namespace oxen::quic
         void handle_ioctx_opt(opt::keep_alive ka);
         void handle_ioctx_opt(opt::idle_timeout ito);
         void handle_ioctx_opt(opt::handshake_timeout hto);
+        void handle_ioctx_opt(opt::congestion_control cc);
+        void handle_ioctx_opt(opt::flow_control fc);
         // Overrides the endpoint outbound alpns if given to connect(...):
         void handle_ioctx_opt(opt::outbound_alpns alpns);
         void handle_ioctx_opt(stream_data_callback func);
