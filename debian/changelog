@@ -1,3 +1,9 @@
+oxen-libquic (1.13.0-1~ubuntu2404) noble; urgency=medium
+
+  * UNRELEASED
+
+ -- Jason Rhinelander <jason@session.foundation>  Mon, 26 Oct 2026 17:00:12 -0300
+
 oxen-libquic (1.13.0~rc1-2~ubuntu2404) noble; urgency=medium
 
   * Rename libquic-common to liboxen-quic-common
