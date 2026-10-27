@@ -73,6 +73,8 @@ namespace oxen::quic
         //      scid: local ("primary") CID used for this connection (random for outgoing)
         //		dcid: remote CID used for this connection
         //      path: network path used to reach remote client
+        //      nat64_remote: for an outbound connection to an IPv4 peer that the host can only reach
+        //          through its network's NAT64, the address to send to; see Endpoint::route_to.
         //      ctx: IO session dedicated for this connection context
         //      alpns: passed directly to TLS session for handshake negotiation. The server
         //          will select the first in the client's list it also supports, so the user
@@ -92,6 +94,7 @@ namespace oxen::quic
                 const quic_cid& scid,
                 const quic_cid& dcid,
                 const Path& path,
+                std::optional<Address> nat64_remote,
                 std::shared_ptr<IOContext> ctx,
                 std::span<const std::string> alpns,
                 std::chrono::nanoseconds default_handshake_timeout,
@@ -354,8 +357,6 @@ namespace oxen::quic
 
         int server_path_validation(const ngtcp2_path* path, bool res, uint32_t flags);
 
-        void set_new_path(Path new_path);
-
         uint64_t get_streams_available_impl() const;
 
         // Called when the endpoint drops its shared pointer to this Connection, to have this
@@ -373,6 +374,7 @@ namespace oxen::quic
                 const quic_cid& scid,
                 const quic_cid& dcid,
                 const Path& path,
+                std::optional<Address> nat64_remote,
                 std::shared_ptr<IOContext> ctx,
                 std::span<const std::string> alpns,
                 std::chrono::nanoseconds default_handshake_timeout,
@@ -397,6 +399,36 @@ namespace oxen::quic
         quic_cid _dest_cid;
 
         Path _path;
+
+        // Set when the peer is an IPv4 address that the host can currently reach only through its
+        // network's NAT64 (Apple platforms only; see Endpoint::route_to): _path, but with the peer's
+        // NAT64 address as its remote.  Packets go to that address instead of _path.remote, and
+        // replies from it are given _path.remote before ngtcp2 sees them, so that to ngtcp2 the
+        // peer's address never changes.
+        std::optional<Path> _nat64_path;
+
+        // Without NAT64 this is _path itself rather than a copy, because ngtcp2 writes each packet's
+        // path into _path as it writes the packet (which is how an inbound connection follows its
+        // peer's migrations).  _nat64_path's local address can't follow such a write, but it never
+        // needs to: an outbound connection's sends don't pin their source address.
+        const Path& send_path() const { return _nat64_path ? *_nat64_path : _path; }
+
+        // How the host reaches the peer: from `local`, and when the peer is an IPv4 address that the
+        // host can only reach through its network's NAT64, to the peer's NAT64 address `nat64` (see
+        // Endpoint::route_to).
+        struct route
+        {
+            Address local;
+            std::optional<Address> nat64;
+
+            bool operator==(const route&) const = default;
+        };
+
+        // Sets _path.local and _nat64_path for `r`; every change to either goes through here (aside
+        // from ngtcp2's own writes into _path), so that the two stay in step.
+        void set_route(route r);
+
+        std::optional<Address> nat64_remote() const;
 
         // True if we are attempting 0-RTT (i.e. enabled it and we found the needed session data)
         // and are still in the 0-RTT period:
@@ -477,32 +509,35 @@ namespace oxen::quic
         // packets arriving there don't each repeat the lookup.
         std::optional<Address> _unconfirmed_local;
 
-        // The local address the host now sends from, when the connection couldn't migrate to it for
-        // want of a spare connection ID.  Those only ever arrive in packets, so the migration is
-        // retried after each packet is read.
-        std::optional<Address> _pending_local;
+        // The route the host now uses, when the connection couldn't migrate to it for want of a
+        // spare connection ID.  Those only ever arrive in packets, so the migration is retried after
+        // each packet is read.
+        std::optional<route> _pending_route;
 
         // Called (on an outbound connection) when a packet arrives on a local address other than
         // _path.local; `ts` is the packet's receive time.
         void local_address_mismatch(const Address& arrived_on, uint64_t ts);
 
-        // What check_local_address() and migrate_local() did.
+        // What check_local_address() and migrate() did.
         enum class local_check {
             unchanged,  // the connection stays on _path.local: the host still sends from it, the
                         // route couldn't be looked up, or ngtcp2 won't migrate this connection
             migrated,
-            pending,  // the host sends from a new address, but migrating waits for a connection ID
+            pending,   // the host sends from a new address, but migrating waits for a connection ID
+            rerouted,  // the host still sends from _path.local, but the peer's NAT64 address changed
         };
 
-        // If the host would now reach the peer from a different local address than _path.local
-        // (i.e. the host's network changed), migrates the connection to it.  Called during a flush,
-        // `ts` must be the flush's timestamp, which ngtcp2 goes on to be given for the rest of the
-        // flush.
+        // If the host would now reach the peer by a different route (i.e. the host's network
+        // changed), moves the connection to it: migrating it if the local address differs from
+        // _path.local and the handshake is confirmed (before which ngtcp2 won't migrate), or
+        // otherwise just sending to the new NAT64 address.  Called during a flush, `ts` must be the
+        // flush's timestamp, which ngtcp2 goes on to be given for the rest of the flush.
         local_check check_local_address(uint64_t ts = get_timestamp().count());
 
-        // Migrates the connection to `local` as its local address, or leaves it as _pending_local if
-        // there is no spare connection ID yet.  (By value: it may be passed _pending_local itself.)
-        local_check migrate_local(Address local, uint64_t ts);
+        // Migrates the connection to `to`, whose local address differs from _path.local, or leaves
+        // it as _pending_route if there is no spare connection ID yet.  (By value: it may be passed
+        // _pending_route itself.)
+        local_check migrate(route to, uint64_t ts);
 
         void schedule_packet_retransmit(std::chrono::steady_clock::time_point ts);
 

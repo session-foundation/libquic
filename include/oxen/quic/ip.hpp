@@ -6,6 +6,7 @@
 #include <limits>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 
@@ -405,6 +406,55 @@ namespace oxen::quic
             if (range.contains(*this))
                 return false;
         return true;
+    }
+
+    // NAT64 (RFC 6052) translates between IPv4 addresses and IPv6 addresses embedding one after the
+    // NAT64's prefix.
+
+    namespace detail
+    {
+        // Which bytes of an IPv6 address hold the four bytes of the IPv4 address it embeds after a
+        // prefix of `bits`, or nullopt if that isn't one of RFC 6052's prefix lengths.  They follow
+        // the prefix, but skip byte 8, which RFC 6052 reserves.
+        constexpr std::optional<std::array<int, 4>> nat64_ipv4_bytes(uint8_t bits)
+        {
+            if (bits != 32 && bits != 40 && bits != 48 && bits != 56 && bits != 64 && bits != 96)
+                return std::nullopt;
+            std::array<int, 4> pos{};
+            int p = bits / 8;
+            for (auto& i : pos)
+            {
+                if (p == 8)
+                    p++;
+                i = p++;
+            }
+            return pos;
+        }
+    }  // namespace detail
+
+    // `addr` embedded after the NAT64 prefix `prefix`, whose length must be 32, 40, 48, 56, 64 or 96.
+    constexpr ipv6 nat64_embed(const ipv6_range& prefix, const ipv4& addr)
+    {
+        auto pos = detail::nat64_ipv4_bytes(prefix.mask);
+        if (!pos)
+            throw std::invalid_argument{"NAT64 prefix length must be 32, 40, 48, 56, 64 or 96"};
+        ipv6 a = prefix.ip;
+        for (int i = 0; i < 4; i++)
+        {
+            const int byte = (*pos)[i];
+            (byte < 8 ? a.hi : a.lo) |= uint64_t{(addr.addr >> (24 - 8 * i)) & 0xff} << (56 - 8 * (byte % 8));
+        }
+        return a;
+    }
+
+    // The NAT64 prefix after which `embedded` embeds `addr`, or nullopt if it doesn't.  Should more
+    // than one prefix length fit, the longest wins, /96 being by far the most used.
+    constexpr std::optional<ipv6_range> nat64_prefix(const ipv6& embedded, const ipv4& addr)
+    {
+        for (uint8_t bits : std::array<uint8_t, 6>{96, 64, 56, 48, 40, 32})
+            if (auto prefix = embedded / bits; nat64_embed(prefix, addr) == embedded)
+                return prefix;
+        return std::nullopt;
     }
 
     namespace detail

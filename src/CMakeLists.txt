@@ -83,6 +83,11 @@ if(WIN32)
     target_link_libraries(quic-utils PUBLIC ws2_32)
 endif()
 
+if(APPLE)
+    # For the endpoint's watch on the host's network (see Endpoint::watch_network)
+    target_link_libraries(quic PUBLIC "-framework Network")
+endif()
+
 if(BUILD_STATIC_DEPS AND MINGW)
     set_source_files_properties(
         gnutls_creds.cpp gnutls_session.cpp

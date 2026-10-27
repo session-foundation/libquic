@@ -698,9 +698,6 @@ namespace oxen::quic
 
     std::optional<Address> UDPSocket::local_address_for(const Address& remote) const
     {
-        if (!bound_.is_any_addr())
-            return bound_;
-
         // A dual-stack socket reaches IPv4 peers at IPv4-mapped addresses, but not every OS lets an
         // IPv6 socket connect to one (Windows and some BSDs default to IPV6_V6ONLY), so we look up
         // the plain IPv4 address and map the answer back.
@@ -708,7 +705,7 @@ namespace oxen::quic
         const auto target = mapped ? remote.unmapped_ipv4_from_ipv6() : remote;
 
         // Connecting a UDP socket sends nothing, but makes the kernel choose the source address that
-        // a send to `target` would use.
+        // a send to `target` would use, or fail if there is no route to it.
         auto sock = ::socket(target.is_ipv6() ? AF_INET6 : AF_INET, SOCK_DGRAM, 0);
 #ifdef _WIN32
         if (sock == INVALID_SOCKET)
@@ -717,14 +714,31 @@ namespace oxen::quic
 #endif
             return std::nullopt;
 
-        std::optional<Address> source;
-        auto addr = target.is_ipv6() ? Address{ipv6{}} : Address{ipv4{}};
-        if (::connect(sock, target, target.socklen()) == 0 && ::getsockname(sock, addr, addr.socklen_ptr()) == 0)
+        // A socket bound to a specific address always sends from it, so the probe does too (on
+        // another port, ours being taken): whether there is a route can depend on the source, and a
+        // bind of the wrong family fails, as a send from ours to `remote` would.
+        const bool specific = !bound_.is_any_addr();
+        bool bound = true;
+        if (specific)
         {
-            if (mapped)
-                addr.map_ipv4_as_ipv6();
-            addr.set_port(bound_.port());
-            source = addr;
+            auto bind_addr = bound_.is_ipv4_mapped_ipv6() ? bound_.unmapped_ipv4_from_ipv6() : bound_;
+            bind_addr.set_port(0);
+            bound = ::bind(sock, bind_addr, bind_addr.socklen()) == 0;
+        }
+
+        std::optional<Address> source;
+        if (bound && ::connect(sock, target, target.socklen()) == 0)
+        {
+            if (specific)
+                source = bound_;
+            else if (auto addr = target.is_ipv6() ? Address{ipv6{}} : Address{ipv4{}};
+                     ::getsockname(sock, addr, addr.socklen_ptr()) == 0)
+            {
+                if (mapped)
+                    addr.map_ipv4_as_ipv6();
+                addr.set_port(bound_.port());
+                source = addr;
+            }
         }
 
 #ifdef _WIN32

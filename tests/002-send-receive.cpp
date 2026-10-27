@@ -1830,10 +1830,15 @@ namespace oxen::quic::test
             return sock->address().port();
         };
 
-        SECTION("A socket bound to a specific address always uses it")
+        SECTION("A socket bound to a specific address uses it, if it reaches the peer from there")
         {
             bind(Address{"127.0.0.1", 0});
             CHECK(sock->local_address_for(Address{"127.0.0.1", 4433}) == sock->address());
+            CHECK_FALSE(sock->local_address_for(Address{"::1", 4433}));
+#ifdef __linux__
+            // Linux routes nowhere else from a loopback address.
+            CHECK_FALSE(sock->local_address_for(Address{"192.0.2.1", 4433}));
+#endif
         }
         SECTION("An IPv4 any-address socket uses the routed source address")
         {
@@ -1854,5 +1859,30 @@ namespace oxen::quic::test
         }
 
         loop.call_get([&] { sock.reset(); });
+    }
+
+    TEST_CASE("002 - IPv4 addresses embedded in NAT64 addresses", "[002][route][nat64]")
+    {
+        // The examples of RFC 6052, section 2.4.
+        const ipv4 v4{192, 0, 2, 33};
+        const auto [prefix, embedded] = GENERATE(table<ipv6_range, ipv6>({
+                {ipv6(0x2001, 0xdb8) / 32, ipv6(0x2001, 0xdb8, 0xc000, 0x221)},
+                {ipv6(0x2001, 0xdb8, 0x100) / 40, ipv6(0x2001, 0xdb8, 0x1c0, 0x2, 0x21)},
+                {ipv6(0x2001, 0xdb8, 0x122) / 48, ipv6(0x2001, 0xdb8, 0x122, 0xc000, 0x2, 0x2100)},
+                {ipv6(0x2001, 0xdb8, 0x122, 0x300) / 56, ipv6(0x2001, 0xdb8, 0x122, 0x3c0, 0, 0x221)},
+                {ipv6(0x2001, 0xdb8, 0x122, 0x344) / 64, ipv6(0x2001, 0xdb8, 0x122, 0x344, 0xc0, 0x2, 0x2100)},
+                {ipv6(0x2001, 0xdb8, 0x122, 0x344) / 96, ipv6(0x2001, 0xdb8, 0x122, 0x344, 0, 0, 0xc000, 0x221)},
+                {ipv6(0x64, 0xff9b) / 96, ipv6(0x64, 0xff9b, 0, 0, 0, 0, 0xc000, 0x221)},
+        }));
+        INFO(prefix.to_string() << " embedding " << v4.to_string());
+
+        CHECK(nat64_embed(prefix, v4) == embedded);
+        auto found = nat64_prefix(embedded, v4);
+        REQUIRE(found);
+        CHECK(*found == prefix);
+
+        CHECK(nat64_embed(prefix, ipv4{198, 51, 100, 7}) != embedded);
+        CHECK_FALSE(nat64_prefix(embedded, ipv4{198, 51, 100, 7}));
+        CHECK_THROWS_AS(nat64_embed(prefix.ip / 80, v4), std::invalid_argument);
     }
 }  // namespace oxen::quic::test
