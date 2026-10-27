@@ -53,10 +53,12 @@ namespace oxen::quic
         // Connections that tried to flush during a stall, to be woken (in order) once it clears.
         std::vector<Connection*> waiters;
 
-        // Packets dropped because they were too large for their path, or because a local queue had
-        // no room for them (used to rate-limit their logging).
+        // Packets dropped because they were too large for their path, because a local queue had no
+        // room for them, or because there was no route to their destination (used to rate-limit
+        // their logging).
         size_t too_big_drops = 0;
         size_t no_buffer_drops = 0;
+        size_t unreachable_drops = 0;
 
 #ifndef NDEBUG
         // Set for the duration of a flush, to catch a flush starting inside another one.

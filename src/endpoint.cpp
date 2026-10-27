@@ -1352,6 +1352,15 @@ namespace oxen::quic
                 return io_result{};
             }
 
+            if (ret.unreachable())
+            {
+                // Likewise the rest would fail too, and the connection carries on without them, but
+                // it needs to know, to look for another route (see Connection::send_unreachable).
+                count_drops(batch().unreachable_drops, n_pkts, "no route to the destination", path);
+                n_pkts = 0;
+                return ret;
+            }
+
             if (ret.failure())
             {
                 log::error(log_cat, "Error sending packets {}: {}", path, ret.str_error());
@@ -1417,6 +1426,7 @@ namespace oxen::quic
         // (closing or draining) cleared itself from `owner` already.
         if (owner && !owner->dead)
         {
+            const auto ts = get_timestamp().count();
             size_t too_big = 0;
             auto rv = send_packets(
                     owner->send_path(),
@@ -1427,13 +1437,15 @@ namespace oxen::quic
                     !owner->is_outbound(),
                     &too_big);
             if (too_big)
-                owner->packet_too_big(too_big, get_timestamp().count());
+                owner->packet_too_big(too_big, ts);
             if (rv.blocked())
             {
                 socket->when_writeable([this] { resume_stalled_send(); });
                 return;
             }
-            if (rv.failure())
+            if (rv.unreachable())
+                owner->send_unreachable(ts);
+            else if (rv.failure())
             {
                 log::warning(log_cat, "Error while trying to send packet: {}", rv.str_error());
                 drop_connection(*owner, io_error{CONN_SEND_FAIL});

@@ -1406,8 +1406,17 @@ namespace oxen::quic::test
     TEST_CASE("002 - Send errors that only lose packets don't close the connection", "[002][senderr]")
     {
         // "too big": with a 1300-byte MTU, ngtcp2's PMTUD probes above that fail with EMSGSIZE.
-        // "no buffers": a few sends fail with ENOBUFS while the stream is being sent.
-        const auto mode = GENERATE(as<std::string>{}, "too big", "no buffers");
+        // The others have the first `n_fails` sends while the stream is being sent fail with `err`:
+        // "no route" as for a moment mid-handover, without the route to the peer having changed;
+        // "network down" as when the interface has just gone down; and in "no route after a stall",
+        // the send that fails is the one finishing a stalled batch.
+        const auto [mode, err, n_fails] = GENERATE(table<std::string, int, size_t>({
+                {"too big", 0, 0},
+                {"no buffers", ENOBUFS, 5},
+                {"no route", ENETUNREACH, 5},
+                {"network down", ENETDOWN, 5},
+                {"no route after a stall", ENETUNREACH, 1},
+        }));
 
         Network test_net{};
 
@@ -1443,8 +1452,10 @@ namespace oxen::quic::test
         auto conn = client_endpoint->connect(server_remote, client_tls);
         REQUIRE(client_established.wait());
 
-        if (mode == "no buffers" && !TestHelper::fail_sends(*client_endpoint, ENOBUFS, 5))
+        if (n_fails && !TestHelper::fail_sends(*client_endpoint, err, n_fails))
             SKIP("Send error testing requires a debug build of libquic");
+        if (mode == "no route after a stall")
+            REQUIRE(TestHelper::block_sends_for(*client_endpoint, 100ms));
 
         auto stream = conn->open_stream();
         stream->send(msg, nullptr);
@@ -1458,8 +1469,10 @@ namespace oxen::quic::test
         auto stats = TestHelper::send_stats(*client_endpoint);
         if (mode == "too big")
             CHECK(stats.too_big_drops > 0);
-        else
+        else if (mode == "no buffers")
             CHECK(stats.no_buffer_drops > 0);
+        else if (mode == "no route after a stall")
+            CHECK(stats.stalls > 0);
         CHECK_FALSE(client_closed);
         CHECK_FALSE(client_endpoint->job_queue.call_get([&] { return conn->is_closing() || conn->is_draining(); }));
     }

@@ -301,6 +301,9 @@ namespace oxen::quic
         /// If the socket has no buffer space (ENOBUFS), the remaining packets are dropped.  Either
         /// way the send still counts as a success: QUIC treats the dropped packets as lost.
         ///
+        /// If there is no route to the peer (`.unreachable()`), the remaining packets are likewise
+        /// dropped, but the error is returned, so that the connection can look for another route.
+        ///
         /// If a more serious error occurs (other than a blocked socket) then `n_pkts` is set to 0
         /// (effectively dropping all packets) and a result is returned with `.failure()` true (and
         /// `.blocked()` false).

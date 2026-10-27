@@ -504,6 +504,11 @@ namespace oxen::quic
         // the timestamp for any ngtcp2 call this makes.
         void packet_too_big(size_t size, uint64_t ts);
 
+        // Called when a send found no route to the peer (see io_result::unreachable), its packets
+        // having been dropped: an outbound connection looks for a new route, but either way the
+        // connection carries on.  `ts` is the timestamp for any ngtcp2 call this makes.
+        void send_unreachable(uint64_t ts);
+
         // The last local address a packet arrived on, other than _path.local, that turned out not
         // to mean the host's source address had changed (e.g. asymmetric routing), so that further
         // packets arriving there don't each repeat the lookup.

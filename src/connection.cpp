@@ -1182,6 +1182,11 @@ namespace oxen::quic
             _endpoint.stall_send(*this);
             return false;
         }
+        else if (rv.unreachable())
+        {
+            send_unreachable(pkt_updater.ts);
+            return false;
+        }
         else if (rv.failure())
         {
             log::warning(log_cat, "Error while trying to send packet: {}", rv.str_error());
@@ -1909,6 +1914,21 @@ namespace oxen::quic
                 reference_id(),
                 size);
         _endpoint.close_connection(*this, io_error{CONN_MTU_EXCEEDED});
+    }
+
+    void Connection::send_unreachable(uint64_t ts)
+    {
+        // No route to the peer usually means the host's network is changing.  The host may already
+        // reach the peer some other way (from a new local address, or on Apple platforms through
+        // NAT64 or no longer through it), in which case an outbound connection moves to that.
+        // Otherwise there may be no route at all for a moment, mid-handover; rather than end the
+        // connection for it, its packets are lost like any others, as when a local queue is full:
+        // QUIC resends them once there is a route again (which network_changed() also looks for),
+        // and the idle timeout ends the connection if there never is.
+        if (is_outbound() && check_local_address(ts) != local_check::unchanged)
+            log::debug(log_cat, "{} found no route to {} on a changed network; carrying on", reference_id(), _path.remote);
+        else
+            log::debug(log_cat, "{} has no route to {}; its packets are lost", reference_id(), _path.remote);
     }
 
     void Connection::local_address_mismatch(const Address& arrived_on, uint64_t ts)
