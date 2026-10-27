@@ -1134,7 +1134,7 @@ namespace oxen::quic
 
         size_t too_big = 0;
         auto rv = _endpoint.send_packets(
-                _path, b.buf.data(), b.size.data(), b.ecn.data(), b.n_packets, !is_outbound(), &too_big);
+                send_path(), b.buf.data(), b.size.data(), b.ecn.data(), b.n_packets, !is_outbound(), &too_big);
         if (too_big)
             packet_too_big(too_big, pkt_updater.ts);
 
@@ -1889,9 +1889,19 @@ namespace oxen::quic
         if (!handshake_confirmed || draining || closing || dead)
             return local_check::unchanged;
 
-        auto source = _endpoint.local_address_for(_path.remote);
+        auto [source, nat64] = _endpoint.route_to(_path.remote);
         if (!source)
             return local_check::unchanged;
+        if (nat64 != _nat64_remote)
+        {
+            log::info(
+                    log_cat,
+                    "{} now reaching {} {}",
+                    reference_id(),
+                    _path.remote,
+                    nat64 ? "through NAT64 at {}"_format(*nat64) : "directly");
+            _nat64_remote = std::move(nat64);
+        }
         if (*source == _path.local)
         {
             // The host's network may have changed and then changed back before we could migrate.
@@ -2076,9 +2086,10 @@ namespace oxen::quic
         // Over IPv6 a 1500-byte MTU carries at most MAX_IPV6_UDP_PAYLOAD, and nothing between 1500
         // and jumbo frames is in real use, so larger sizes would only be wasted probes.  Capping
         // max_tx_udp_payload_size is enough: ngtcp2 skips any probe larger than it.  IPv4-mapped
-        // addresses (from dual-stack sockets) are sent as IPv4.
+        // addresses (from dual-stack sockets) are sent as IPv4, but a NAT64 address is IPv6.
+        const auto& dest = _nat64_remote ? *_nat64_remote : _path.remote;
         const size_t family_max =
-                _path.remote.is_ipv6() && !_path.remote.is_ipv4_mapped_ipv6() ? MAX_IPV6_UDP_PAYLOAD : MAX_PMTUD_UDP_PAYLOAD;
+                dest.is_ipv6() && !dest.is_ipv4_mapped_ipv6() ? MAX_IPV6_UDP_PAYLOAD : MAX_PMTUD_UDP_PAYLOAD;
         size_t max_payload = MIN_UDP_PAYLOAD;
         for (auto size : probes)
             if (size <= family_max)
@@ -2138,6 +2149,7 @@ namespace oxen::quic
             const quic_cid& scid,
             const quic_cid& dcid,
             const Path& path,
+            std::optional<Address> nat64_remote,
             std::shared_ptr<IOContext> ctx,
             std::span<const std::string> alpns,
             std::chrono::nanoseconds default_handshake_timeout,
@@ -2155,6 +2167,7 @@ namespace oxen::quic
             _source_cid{scid},
             _dest_cid{dcid},
             _path{path},
+            _nat64_remote{std::move(nat64_remote)},
             _max_streams{context->config.max_streams ? context->config.max_streams : DEFAULT_MAX_BIDI_STREAMS},
             _packet_splitting{context->config.split_packet},
             tls_creds{context->tls_creds}
@@ -2380,6 +2393,7 @@ namespace oxen::quic
             const quic_cid& scid,
             const quic_cid& dcid,
             const Path& path,
+            std::optional<Address> nat64_remote,
             std::shared_ptr<IOContext> ctx,
             std::span<const std::string> alpns,
             std::chrono::nanoseconds default_handshake_timeout,
@@ -2396,6 +2410,7 @@ namespace oxen::quic
                 scid,
                 dcid,
                 path,
+                std::move(nat64_remote),
                 std::move(ctx),
                 alpns,
                 default_handshake_timeout,

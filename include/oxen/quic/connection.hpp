@@ -71,6 +71,8 @@ namespace oxen::quic
         //      scid: local ("primary") CID used for this connection (random for outgoing)
         //		dcid: remote CID used for this connection
         //      path: network path used to reach remote client
+        //      nat64_remote: for an outbound connection to an IPv4 peer that the host can only reach
+        //          through its network's NAT64, the address to send to; see Endpoint::route_to.
         //      ctx: IO session dedicated for this connection context
         //      alpns: passed directly to TLS session for handshake negotiation. The server
         //          will select the first in the client's list it also supports, so the user
@@ -90,6 +92,7 @@ namespace oxen::quic
                 const quic_cid& scid,
                 const quic_cid& dcid,
                 const Path& path,
+                std::optional<Address> nat64_remote,
                 std::shared_ptr<IOContext> ctx,
                 std::span<const std::string> alpns,
                 std::chrono::nanoseconds default_handshake_timeout,
@@ -371,6 +374,7 @@ namespace oxen::quic
                 const quic_cid& scid,
                 const quic_cid& dcid,
                 const Path& path,
+                std::optional<Address> nat64_remote,
                 std::shared_ptr<IOContext> ctx,
                 std::span<const std::string> alpns,
                 std::chrono::nanoseconds default_handshake_timeout,
@@ -395,6 +399,15 @@ namespace oxen::quic
         quic_cid _dest_cid;
 
         Path _path;
+
+        // Set when the peer is an IPv4 address that the host can currently reach only through its
+        // network's NAT64 (Apple platforms only; see Endpoint::route_to): packets go to this IPv6
+        // address instead of _path.remote, and replies from it are given _path.remote before ngtcp2
+        // sees them, so that to ngtcp2 the peer's address never changes.
+        std::optional<Address> _nat64_remote;
+
+        // The path packets are actually sent on: _path, but to _nat64_remote when that is set.
+        Path send_path() const { return _nat64_remote ? Path{_path.local, *_nat64_remote} : _path; }
 
         // True if we are attempting 0-RTT (i.e. enabled it and we found the needed session data)
         // and are still in the 0-RTT period:
@@ -493,9 +506,9 @@ namespace oxen::quic
         };
 
         // If the host would now reach the peer from a different local address than _path.local
-        // (i.e. the host's network changed), migrates the connection to it.  Called during a flush,
-        // `ts` must be the flush's timestamp, which ngtcp2 goes on to be given for the rest of the
-        // flush.
+        // (i.e. the host's network changed), migrates the connection to it, updating _nat64_remote
+        // for whether the new network reaches the peer through NAT64.  Called during a flush, `ts`
+        // must be the flush's timestamp, which ngtcp2 goes on to be given for the rest of the flush.
         local_check check_local_address(uint64_t ts = get_timestamp().count());
 
         // Migrates the connection to `local` as its local address, or leaves it as _pending_local if
