@@ -143,6 +143,16 @@ namespace oxen::quic
 #endif
                           : error_code == ENOBUFS;
         }
+        // returns true if error value indicates that the host has no route to the destination (e.g.
+        // an IPv4 destination on a network with no IPv4)
+        bool unreachable() const
+        {
+            return is_ngtcp2 ? false
+#ifdef _WIN32
+                 : is_wsa ? (error_code == WSAENETUNREACH || error_code == WSAEHOSTUNREACH)
+#endif
+                          : (error_code == ENETUNREACH || error_code == EHOSTUNREACH);
+        }
 
         // returns the error message string describing error_code
         std::conditional_t<IN_HELL, std::string, std::string_view> str_error() const;

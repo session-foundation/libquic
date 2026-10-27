@@ -1146,6 +1146,16 @@ namespace oxen::quic
         }
         else if (rv.failure())
         {
+            // No route to the peer can mean the host's network has just changed to one that
+            // reaches it some other way (on Apple platforms, through NAT64 or no longer through
+            // it), in which case the connection carries on from the new path and QUIC resends what
+            // was lost.
+            if (rv.unreachable() && is_outbound() && check_local_address(pkt_updater.ts) != local_check::unchanged)
+            {
+                log::debug(log_cat, "{} send failed ({}) on a changed network; carrying on", reference_id(), rv.str_error());
+                return false;
+            }
+
             log::warning(log_cat, "Error while trying to send packet: {}", rv.str_error());
             pkt_updater.cancel();
 
