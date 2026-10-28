@@ -123,8 +123,11 @@ namespace oxen::quic
         // something small (e.g. a keep-alive) is sent.
         //
         // An application can call this from the operating system's network change notifications
-        // (e.g. Android's ConnectivityManager.NetworkCallback, or Apple's NWPathMonitor).  It may be
-        // called from any thread, and is cheap and harmless when nothing has actually changed.
+        // (e.g. Android's ConnectivityManager.NetworkCallback).  It may be called from any thread,
+        // and is cheap and harmless when nothing has actually changed.  On Apple platforms libquic
+        // calls it itself, from its own watch on the network, once the endpoint has made an outbound
+        // connection: there a change can also mean IPv4 peers have to be reached through the
+        // network's NAT64 (or no longer are), which a connection can't otherwise notice.
         void network_changed();
 
         const Address& local() const { return _local; }
@@ -313,6 +316,23 @@ namespace oxen::quic
         // The local address our socket would currently use to reach `remote` (see
         // UDPSocket::local_address_for), or nullopt if that can't be determined.
         std::optional<Address> local_address_for(const Address& remote) const;
+
+        // How the host would now reach `remote`: the local address it would send from, and, only
+        // for an IPv4 peer on an Apple device with no IPv4 route to it, the network's NAT64 address
+        // for it, to send to instead.  `source` is nullopt if there is no route at all.
+        struct route
+        {
+            std::optional<Address> source;
+            std::optional<Address> nat64;
+        };
+        route route_to(const Address& remote) const;
+
+#ifdef __APPLE__
+        // Watches the host's network, calling network_changed() on each change; started by the
+        // first outbound connection.
+        std::shared_ptr<void> _network_monitor;
+        void watch_network();
+#endif
 
         send_batch& batch() { return *_send_batch; }
 
