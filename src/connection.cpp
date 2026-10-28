@@ -787,10 +787,12 @@ namespace oxen::quic
         // that happens ngtcp2 reverts all stream state.  So we prepend all our streams back into
         // pending_streams (in reverse order so that they will get opened in the same order) then
         // call check_pending_streams to reopen them.
+        std::vector<std::shared_ptr<Stream>> reverted;
         for (auto& [id, stream] : std::ranges::views::reverse(_streams))
         {
             log::debug(log_cat, "Resetting early stream {} and returning to pending streams", id);
             stream->revert_stream();
+            reverted.push_back(stream);
             stream->set_ready(false);
             if (!(id & 0x01))
             {  // Client-initiated stream (and we are always the client)
@@ -810,6 +812,13 @@ namespace oxen::quic
 
         if (dgrams)
             dgrams->early_data_end(false);
+
+        // Reverting made the streams' sent data unsent again, which can cross a watermark.  Checked
+        // only now because the callbacks are application code, which should not see the
+        // connection with its streams half moved.
+        for (auto& s : reverted)
+            if (s->_watermarking)
+                s->check_watermark();
     }
 
     void Connection::reset_early_datagrams()
