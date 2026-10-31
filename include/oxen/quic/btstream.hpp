@@ -54,6 +54,16 @@ namespace oxen::quic
             size_t size;
             explicit max_request_size(size_t bytes) : size{bytes} {}
         };
+
+        // BTRequestStream::command() option: by default a request that times out before any of it
+        // has been sent is withdrawn from the stream, since its reply could no longer be delivered
+        // and the caller has already been told that it failed.  Passing this leaves such a request
+        // queued, to be sent anyway, for a request wanted for its effect on the other side even
+        // once its reply is no longer awaited.  (A request that has been partly sent is always
+        // sent in full, as cutting it short would corrupt the stream.)
+        struct send_after_timeout_t
+        {};
+        inline constexpr send_after_timeout_t send_after_timeout{};
     }  // namespace opt
 
     class BTRequestStream;
@@ -170,6 +180,12 @@ namespace oxen::quic
         time_point expiry;
         std::optional<std::chrono::milliseconds> timeout;
 
+        // False if opt::send_after_timeout was given.
+        bool withdraw_on_timeout = true;
+        // The keep-alive of the request's buffer on the stream, while the stream still holds it;
+        // set only if the request is to be withdrawn on timeout.
+        std::weak_ptr<void> queued;
+
         bool is_empty() const { return data.empty() && total_len == 0; }
 
         // Defined below, once BTRequestStream is complete.
@@ -201,6 +217,7 @@ namespace oxen::quic
 
         void handle_req_opts(std::function<void(message)> func) { cb = std::move(func); }
         void handle_req_opts(std::chrono::milliseconds exp) { timeout = exp; }
+        void handle_req_opts(opt::send_after_timeout_t) { withdraw_on_timeout = false; }
 
         template <typename Opt>
         void handle_req_opts(std::optional<Opt> option)
@@ -315,6 +332,8 @@ namespace oxen::quic
                 Opt&&... opts:
                     std::function<void(message)> cb - callback to be executed if expecting response
                     std::chrono::milliseconds timeout - request timeout (defaults to 10 seconds)
+                    opt::send_after_timeout - send the request even if it times out before any of
+                        it has been sent, rather than withdrawing it (see opt::send_after_timeout)
         */
         template <typename... Opt>
         void command(std::string ep, std::span<const std::byte> body, Opt&&... opts)
@@ -325,7 +344,13 @@ namespace oxen::quic
             if (req->needs_response())
                 job_queue.call([this, r = std::move(req)]() mutable {
                     if (auto* req = add_sent_request(std::move(r)))
-                        send(std::move(req->data));
+                    {
+                        auto buf = std::make_shared<std::string>(std::move(req->data));
+                        if (req->withdraw_on_timeout)
+                            req->queued = buf;
+                        std::string_view view{*buf};
+                        send(view, std::move(buf));
+                    }
                 });
             else
                 send(std::move(*req).data);

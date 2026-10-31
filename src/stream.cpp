@@ -382,6 +382,30 @@ namespace oxen::quic
         }
     }
 
+    bool Stream::withdraw(const std::shared_ptr<void>& keep_alive)
+    {
+        assert(job_queue.inside());
+
+        // Everything past the send point is wholly unsent, but the buffer at it may be partly sent:
+        // its sent bytes are either still unacked (the offset) or, at the front, acked and trimmed
+        // off, which takes them out of the offset as well.
+        bool started = _current_buffer_offset > 0 || (_current_buffer_index == 0 && _front_trimmed > 0);
+        auto first = _current_buffer_index + (started ? 1 : 0);
+        for (auto i = first; i < user_buffers.size(); i++)
+        {
+            if (user_buffers[i].second != keep_alive)
+                continue;
+            auto size = user_buffers[i].first.size();
+            log::debug(log_cat, "Stream (ID:{}) withdrawing {}B of unsent data", _stream_id, size);
+            _unsent_size -= size;
+            user_buffers.erase(user_buffers.begin() + i);
+            if (_watermarking)
+                check_watermark();
+            return true;
+        }
+        return false;
+    }
+
     void Stream::revert_stream()
     {
         assert(job_queue.inside());
