@@ -1406,8 +1406,17 @@ namespace oxen::quic::test
     TEST_CASE("002 - Send errors that only lose packets don't close the connection", "[002][senderr]")
     {
         // "too big": with a 1300-byte MTU, ngtcp2's PMTUD probes above that fail with EMSGSIZE.
-        // "no buffers": a few sends fail with ENOBUFS while the stream is being sent.
-        const auto mode = GENERATE(as<std::string>{}, "too big", "no buffers");
+        // The others have the first `n_fails` sends while the stream is being sent fail with `err`:
+        // "no route" as for a moment mid-handover, without the route to the peer having changed;
+        // "network down" as when the interface has just gone down; and in "no route after a stall",
+        // the send that fails is the one finishing a stalled batch.
+        const auto [mode, err, n_fails] = GENERATE(table<std::string, int, size_t>({
+                {"too big", 0, 0},
+                {"no buffers", ENOBUFS, 5},
+                {"no route", ENETUNREACH, 5},
+                {"network down", ENETDOWN, 5},
+                {"no route after a stall", ENETUNREACH, 1},
+        }));
 
         Network test_net{};
 
@@ -1443,8 +1452,10 @@ namespace oxen::quic::test
         auto conn = client_endpoint->connect(server_remote, client_tls);
         REQUIRE(client_established.wait());
 
-        if (mode == "no buffers" && !TestHelper::fail_sends(*client_endpoint, ENOBUFS, 5))
+        if (n_fails && !TestHelper::fail_sends(*client_endpoint, err, n_fails))
             SKIP("Send error testing requires a debug build of libquic");
+        if (mode == "no route after a stall")
+            REQUIRE(TestHelper::block_sends_for(*client_endpoint, 100ms));
 
         auto stream = conn->open_stream();
         stream->send(msg, nullptr);
@@ -1458,8 +1469,10 @@ namespace oxen::quic::test
         auto stats = TestHelper::send_stats(*client_endpoint);
         if (mode == "too big")
             CHECK(stats.too_big_drops > 0);
-        else
+        else if (mode == "no buffers")
             CHECK(stats.no_buffer_drops > 0);
+        else if (mode == "no route after a stall")
+            CHECK(stats.stalls > 0);
         CHECK_FALSE(client_closed);
         CHECK_FALSE(client_endpoint->job_queue.call_get([&] { return conn->is_closing() || conn->is_draining(); }));
     }
@@ -1830,10 +1843,15 @@ namespace oxen::quic::test
             return sock->address().port();
         };
 
-        SECTION("A socket bound to a specific address always uses it")
+        SECTION("A socket bound to a specific address uses it, if it reaches the peer from there")
         {
             bind(Address{"127.0.0.1", 0});
             CHECK(sock->local_address_for(Address{"127.0.0.1", 4433}) == sock->address());
+            CHECK_FALSE(sock->local_address_for(Address{"::1", 4433}));
+#ifdef __linux__
+            // Linux routes nowhere else from a loopback address.
+            CHECK_FALSE(sock->local_address_for(Address{"192.0.2.1", 4433}));
+#endif
         }
         SECTION("An IPv4 any-address socket uses the routed source address")
         {
@@ -1854,5 +1872,30 @@ namespace oxen::quic::test
         }
 
         loop.call_get([&] { sock.reset(); });
+    }
+
+    TEST_CASE("002 - IPv4 addresses embedded in NAT64 addresses", "[002][route][nat64]")
+    {
+        // The examples of RFC 6052, section 2.4.
+        const ipv4 v4{192, 0, 2, 33};
+        const auto [prefix, embedded] = GENERATE(table<ipv6_range, ipv6>({
+                {ipv6(0x2001, 0xdb8) / 32, ipv6(0x2001, 0xdb8, 0xc000, 0x221)},
+                {ipv6(0x2001, 0xdb8, 0x100) / 40, ipv6(0x2001, 0xdb8, 0x1c0, 0x2, 0x21)},
+                {ipv6(0x2001, 0xdb8, 0x122) / 48, ipv6(0x2001, 0xdb8, 0x122, 0xc000, 0x2, 0x2100)},
+                {ipv6(0x2001, 0xdb8, 0x122, 0x300) / 56, ipv6(0x2001, 0xdb8, 0x122, 0x3c0, 0, 0x221)},
+                {ipv6(0x2001, 0xdb8, 0x122, 0x344) / 64, ipv6(0x2001, 0xdb8, 0x122, 0x344, 0xc0, 0x2, 0x2100)},
+                {ipv6(0x2001, 0xdb8, 0x122, 0x344) / 96, ipv6(0x2001, 0xdb8, 0x122, 0x344, 0, 0, 0xc000, 0x221)},
+                {ipv6(0x64, 0xff9b) / 96, ipv6(0x64, 0xff9b, 0, 0, 0, 0, 0xc000, 0x221)},
+        }));
+        INFO(prefix.to_string() << " embedding " << v4.to_string());
+
+        CHECK(nat64_embed(prefix, v4) == embedded);
+        auto found = nat64_prefix(embedded, v4);
+        REQUIRE(found);
+        CHECK(*found == prefix);
+
+        CHECK(nat64_embed(prefix, ipv4{198, 51, 100, 7}) != embedded);
+        CHECK_FALSE(nat64_prefix(embedded, ipv4{198, 51, 100, 7}));
+        CHECK_THROWS_AS(nat64_embed(prefix.ip / 80, v4), std::invalid_argument);
     }
 }  // namespace oxen::quic::test

@@ -132,9 +132,9 @@ namespace oxen::quic
         const Address& address() const { return bound_; }
 
         /// Returns the local address this socket would currently use to send to `remote`, or nullopt
-        /// if there is no route to it.  On a socket bound to a specific address that is always the
-        /// bound address; on one bound to the any-address it follows the host's routing, and so can
-        /// change when the host's network does.
+        /// if there is no route to it.  On a socket bound to a specific address that is the bound
+        /// address, when the host has a route to `remote` from it; on one bound to the any-address it
+        /// follows the host's routing, and so can change when the host's network does.
         std::optional<Address> local_address_for(const Address& remote) const;
 
         /// Attempts to send one or more UDP payloads on a single path.  Returns a pair: an
