@@ -19,6 +19,11 @@ namespace oxen::quic::test
         std::promise<void> client_established_prom;
         auto client_established = [&client_established_prom](Connection&) { client_established_prom.set_value(); };
 
+        // These are captured by reference in connection callbacks, and so must outlive the endpoints
+        // (and loop) in case a REQUIRE failure unwinds while a response is still in flight.
+        std::promise<std::chrono::nanoseconds> stream_response_time, dgram_response_time;
+        std::chrono::steady_clock::time_point started;
+
         Loop loop;
 
         auto delayer = packet_delayer::make(loop, 0ms);  // no delay initially, but we'll ramp it up later
@@ -211,8 +216,7 @@ namespace oxen::quic::test
 
         delayer->delay = SIMULATED_RTT / 2;
 
-        std::promise<std::chrono::nanoseconds> stream_response_time, dgram_response_time;
-        auto started = std::chrono::steady_clock::now();
+        started = std::chrono::steady_clock::now();
         auto client_ci = client_endpoint->connect(
                 client_remote,
                 client_tls,
@@ -226,17 +230,21 @@ namespace oxen::quic::test
         s->send("hello"s);
         client_ci->datagrams()->send("42"s);
 
-        require_future(client_established_prom.get_future());
-        require_future(server_established_prom.get_future());
+        // The client's established callback waits for handshake confirmation, which can take one RTT
+        // longer than the data response (e.g. 3 RTTs with a retry and rejected early data), and so
+        // can exceed the default timeout with the slower simulated RTTs.
+        const auto timeout = SIMULATED_RTT * (expected_rtt + 2);
+        require_future(client_established_prom.get_future(), timeout);
+        require_future(server_established_prom.get_future(), timeout);
 
         auto dgram_fut = dgram_response_time.get_future();
-        require_future(dgram_fut, SIMULATED_RTT * (expected_rtt + 2));
+        require_future(dgram_fut, timeout);
         auto dgram_time = dgram_fut.get();
         CHECK(dgram_time > expected_rtt * SIMULATED_RTT - RTT_BUFFER);
         CHECK(dgram_time < expected_rtt * SIMULATED_RTT + RTT_BUFFER);
 
         auto stream_fut = stream_response_time.get_future();
-        require_future(stream_fut, SIMULATED_RTT * (expected_rtt + 2));
+        require_future(stream_fut, timeout);
         auto stream_time = stream_fut.get();
         CHECK(stream_time > expected_rtt * SIMULATED_RTT - RTT_BUFFER);
         CHECK(stream_time < expected_rtt * SIMULATED_RTT + RTT_BUFFER);
