@@ -548,8 +548,9 @@ namespace oxen::quic
     // loop and is not meant to be particularly performant.
     //
     // To use this you must:
-    // - construct this object via `auto delayer = packet_delayer::make(10ms);`.  You generally want
-    //   this to outlast the loop (i.e. declare it earlier) to avoid destruction issues.
+    // - construct this object via `auto delayer = packet_delayer::make(loop, 10ms);`.  It must not
+    //   outlive the loop (i.e. declare it after the loop); its destruction is dispatched to the loop
+    //   thread.
     // - construct the endpoint, passing `*delayer` to the `endpoint(...)` call (this object
     //   auto-converts into the appropriate manual routing option).
     // - call `delayer->init(ep)`, providing the endpoint which starts the actual underlying socket,
@@ -569,7 +570,7 @@ namespace oxen::quic
         explicit packet_delayer(std::chrono::milliseconds delay) : delay{delay} {}
 
       public:
-        static std::shared_ptr<packet_delayer> make(std::chrono::milliseconds delay = 10ms);
+        static std::shared_ptr<packet_delayer> make(Loop& loop, std::chrono::milliseconds delay = 10ms);
 
         // Non-copyable, non-movable:
         packet_delayer(packet_delayer&&) = delete;

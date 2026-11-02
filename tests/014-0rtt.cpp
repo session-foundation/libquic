@@ -19,9 +19,9 @@ namespace oxen::quic::test
         std::promise<void> client_established_prom;
         auto client_established = [&client_established_prom](Connection&) { client_established_prom.set_value(); };
 
-        auto delayer = packet_delayer::make(0ms);  // no delay initially, but we'll ramp it up later
-
         Loop loop;
+
+        auto delayer = packet_delayer::make(loop, 0ms);  // no delay initially, but we'll ramp it up later
 
         auto [client_tls, server_tls] = defaults::tls_creds_from_ed_keys();
         server_tls->enable_inbound_0rtt();
