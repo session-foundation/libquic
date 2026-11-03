@@ -192,24 +192,22 @@ namespace oxen::quic
 #endif
     }
 
+    [[noreturn]] static void raise_error(const std::error_code& ec, std::string_view action)
+    {
+        log::error(log_cat, "Got error {} ({}) during {}", ec.value(), ec.message(), action);
+        throw std::system_error{ec};
+    }
+
     /// Checks rv for being -1 and, if so, raises a system_error from errno.  Otherwise returns it.
     static int check_rv(int rv, std::string_view action)
     {
-        std::optional<std::error_code> ec;
 #ifdef _WIN32
         if (rv == SOCKET_ERROR)
-            ec.emplace(WSAGetLastError(), std::system_category());
+            raise_error({WSAGetLastError(), std::system_category()}, action);
 #else
         if (rv == -1)
-            ec.emplace(errno, std::system_category());
-
+            raise_error({errno, std::system_category()}, action);
 #endif
-        if (ec)
-        {
-            log::error(log_cat, "Got error {} ({}) during {}", ec->value(), ec->message(), action);
-            throw std::system_error{*ec};
-        }
-
         return rv;
     }
 
@@ -516,6 +514,105 @@ namespace oxen::quic
 #endif
     };
 
+#ifdef __APPLE__
+    // When choosing a port for a dual-stack IPv6 socket bound to port 0, the Apple kernel only
+    // checks for conflicts with other IPv6 sockets (in6_pcbsetport looks candidates up with
+    // in6_pcblookup_local, which skips IPv4 sockets), so it can hand out a port that an IPv4 socket
+    // in any process already has bound to 0.0.0.0.  The kernel then delivers all of the port's IPv4
+    // traffic to that IPv4 socket, silently starving ours.  This is a long-standing bug, reported to
+    // Apple as FB12128351 and FB25058707 and seen on every macOS version tested, 10.x through 27.
+    //
+    // Separately, and by design (in6_pcbbind exempts an AF_INET socket bound to INADDR_ANY from the
+    // conflict check), an explicit dual-stack bind may share a port with an IPv4 0.0.0.0 socket, with
+    // the same result.  IPv4 binds, on the other hand, are checked against both IPv4 and dual-stack
+    // sockets.  So we reserve the port with an IPv4 wildcard socket, which refuses an explicit port
+    // that is already taken (as Linux would), and bind the dual-stack socket to the reserved port
+    // while the reservation is held, which that same exemption permits.
+
+    // Binds a new IPv4 socket to 0.0.0.0:port (the kernel picks the port if it is 0), returning the
+    // socket, which the caller must close, and its port.
+    static std::pair<int, uint16_t> reserve_ipv4_port(uint16_t port, std::error_code& ec)
+    {
+        const int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock < 0)
+        {
+            ec.assign(errno, std::system_category());
+            return {-1, 0};
+        }
+        Address reserved{ipv4{}, port};
+        if (bind(sock, reserved, reserved.socklen()) != 0 || getsockname(sock, reserved, reserved.socklen_ptr()) != 0)
+        {
+            ec.assign(errno, std::system_category());
+            ::close(sock);
+            return {-1, 0};
+        }
+        return {sock, reserved.port()};
+    }
+
+    // Whether a dual-stack bind may share a port with an IPv4 wildcard socket, which the reservation
+    // depends on.  This is deliberate, long-standing kernel behaviour, but without it every
+    // reserved bind would fail, so it is checked once rather than assumed.  If the check can't run
+    // at all, the reservation couldn't be made either.
+    static bool dual_stack_can_share_ipv4_port()
+    {
+        static const bool can_share = [] {
+            std::error_code ec;
+            auto [v4, port] = reserve_ipv4_port(0, ec);
+            if (v4 < 0)
+            {
+                log::debug(log_cat, "Unable to check dual-stack port sharing with IPv4 ({})", ec.message());
+                return false;
+            }
+            bool result = false;
+            if (const int v6 = socket(AF_INET6, SOCK_DGRAM, 0); v6 >= 0)
+            {
+                const int off = 0;
+                Address probe{ipv6{}, port};
+                result = setsockopt(v6, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off)) == 0 &&
+                         bind(v6, probe, probe.socklen()) == 0;
+                ::close(v6);
+            }
+            ::close(v4);
+            log::debug(log_cat, "Dual-stack sockets {} share a port with IPv4 wildcard sockets", result ? "can" : "cannot");
+            return result;
+        }();
+        return can_share;
+    }
+
+    static void bind_dual_stack(UDPSocket::socket_t sock, Address addr)
+    {
+        const bool any_port = addr.is_any_port();
+        for (int attempt = 1;; attempt++)
+        {
+            std::error_code ec;
+            auto [reservation, port] = reserve_ipv4_port(addr.port(), ec);
+            if (reservation < 0)
+            {
+                // An explicit port that an IPv4 or dual-stack socket already holds: refuse it, as
+                // Linux would.  Any other failure just means going without the protection.
+                if (!any_port && ec == std::errc::address_in_use)
+                    raise_error(ec, "bind");
+                log::debug(log_cat, "Unable to reserve IPv4 port for dual-stack bind ({})", ec.message());
+                check_rv(bind(sock, addr, addr.socklen()), "bind");
+                return;
+            }
+
+            addr.set_port(port);
+            const int rv = bind(sock, addr, addr.socklen());
+            ec.assign(errno, std::system_category());
+            ::close(reservation);
+
+            if (rv == 0)
+                return;
+
+            // The reservation says nothing about IPv6-only sockets, so a kernel-chosen port can still
+            // collide with one of those; just try another.
+            if (!(any_port && ec == std::errc::address_in_use && attempt < 100))
+                raise_error(ec, "bind");
+        }
+    }
+#endif
+
     UDPSocket::UDPSocket(event_base* ev_loop, const Address& addr, options opts, receive_callback_t on_receive) :
             gso_{GSO_SUPPORTED && opts.allow_gso}, ev_{ev_loop}, receive_callback_{std::move(on_receive)}
     {
@@ -612,8 +709,12 @@ namespace oxen::quic
 #endif
         }
 
-        // Bind!
-        check_rv(bind(sock_, addr, addr.socklen()), "bind");
+#ifdef __APPLE__
+        if (addr.is_ipv6() && addr.dual_stack && dual_stack_can_share_ipv4_port())
+            bind_dual_stack(sock_, addr);
+        else
+#endif
+            check_rv(bind(sock_, addr, addr.socklen()), "bind");
         check_rv(getsockname(sock_, bound_, bound_.socklen_ptr()), "getsockname");
 
         // Make the socket non-blocking:
