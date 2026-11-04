@@ -1,6 +1,6 @@
 #include "loop.hpp"
 
-#include "internal.hpp"
+#include "utils_internal.hpp"
 
 #include <event2/event.h>
 #include <event2/thread.h>
@@ -10,9 +10,30 @@
 #include <atomic>
 #include <mutex>
 
+#ifndef _WIN32
+extern "C"
+{
+#include <sys/time.h>
+}
+#endif
+
 namespace oxen::quic
 {
     static auto ev_cat = log::Cat("ev-loop");
+
+    static timeval loop_time_to_timeval(std::chrono::microseconds t)
+    {
+        timeval tv;
+        tv.tv_sec = t / 1s;
+        tv.tv_usec = (t % 1s) / 1us;
+        return tv;
+    }
+
+    void event_deleter::operator()(::event* e) const
+    {
+        if (e)
+            ::event_free(e);
+    }
 
     static void setup_libevent_logging()
     {
