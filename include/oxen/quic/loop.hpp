@@ -1,5 +1,6 @@
 #pragma once
 
+#include "event_ptr.hpp"
 #include "timer_id.hpp"
 #include "utils.hpp"
 

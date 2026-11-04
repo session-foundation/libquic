@@ -135,7 +135,13 @@ namespace oxen::quic
         req_expiries.erase(req_expiries.begin(), it);
 
         for (auto& sr : expired)
+        {
+            // Not when closing (no `now`): the stream is going away, unsent data and all.
+            if (now)
+                if (auto buf = sr->queued.lock())
+                    withdraw(buf);
             sr->time_out();
+        }
     }
 
     void BTRequestStream::update_timeout()

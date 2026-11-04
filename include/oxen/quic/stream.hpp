@@ -281,6 +281,12 @@ namespace oxen::quic
         /// once no longer needed.  If overriding, be sure to call the base class method!
         virtual void wrote(size_t bytes);
 
+        /// Removes the queued buffer whose keep-alive is `keep_alive`, provided none of it has been
+        /// written into a packet yet: data the other side has not seen any of can be dropped
+        /// without its noticing, but a buffer partly sent has to be finished.  Returns true if it
+        /// was removed.  Must be called on the event loop thread.
+        bool withdraw(const std::shared_ptr<void>& keep_alive);
+
       private:
         // Event-loop-side implementation of retained_bytes(); see that method for what this counts.
         size_t retained_impl() const { return _unacked_size + _unsent_size + _front_trimmed; }

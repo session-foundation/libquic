@@ -158,6 +158,22 @@ namespace oxen::quic::test
         {
             client_endpoint->network_changed();
         }
+        SECTION("Noticed when a send finds no route, rather than closing the connection")
+        {
+            // As when a host moves to a network with no route to the peer's address: the failed
+            // send, rather than closing the connection, has it look again at how to reach the peer.
+            REQUIRE(TestHelper::fail_sends(*client_endpoint, ENETUNREACH, 1));
+            stream->send("two"s);
+            REQUIRE(wait_for_received("two"));
+        }
+        SECTION("Noticed when the send finishing a stalled batch finds no route")
+        {
+            REQUIRE(TestHelper::fail_sends(*client_endpoint, ENETUNREACH, 1));
+            REQUIRE(TestHelper::block_sends_for(*client_endpoint, 100ms));
+            stream->send("two"s);
+            REQUIRE(wait_for_received("two"));
+            CHECK(TestHelper::send_stats(*client_endpoint).stalls > 0);
+        }
         SECTION("Once a later packet arrives, when there was no spare connection ID")
         {
             // Both the attempt when the server's acknowledgement first arrives on the new address,
