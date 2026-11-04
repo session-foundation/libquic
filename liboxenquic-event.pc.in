@@ -1,0 +1,12 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+exec_prefix=${prefix}
+libdir=@CMAKE_INSTALL_FULL_LIBDIR@
+includedir=@CMAKE_INSTALL_FULL_INCLUDEDIR@
+
+Name: liboxenquic-event
+Description: libevent-based event loop and job queue from liboxenquic, without its ngtcp2 dependency
+Version: @PROJECT_VERSION@
+
+Libs: -L${libdir} -loxenquic-event
+Requires: liboxenquic-utils libevent_core libevent_pthreads
+Cflags: -I${includedir}

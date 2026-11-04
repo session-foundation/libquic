@@ -1,6 +1,6 @@
 #include "ip.hpp"
 
-#include "internal.hpp"
+#include "utils_internal.hpp"
 
 extern "C"
 {
