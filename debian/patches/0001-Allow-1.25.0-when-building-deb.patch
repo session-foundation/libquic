@@ -10,7 +10,7 @@ coupled with a >= 1.25.0+stf requirement in debian/control).
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
-index 4d12419..805015a 100644
+index 5659abe..afceccd 100644
 --- a/src/CMakeLists.txt
 +++ b/src/CMakeLists.txt
 @@ -5,7 +5,7 @@ configure_file(version.cpp.in version.cpp @ONLY)
