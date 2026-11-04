@@ -1,6 +1,6 @@
 Source: oxen-libquic
 Priority: optional
-Maintainer: Jason Rhinelander <jason@oxen.io>
+Maintainer: Jason Rhinelander <jason@session.foundation>
 Build-Depends:
     debhelper-compat (= 13),
     cmake (>= 3.20),
@@ -14,7 +14,7 @@ Build-Depends:
     liboxenc-dev (>= 1.5.0)
 Standards-Version: 4.4.1
 Section: libs
-Homepage: https://github.com/oxen-io/oxen-libquic
+Homepage: https://github.com/session-foundation/libquic
 
 Package: liboxen-quic-dev
 Section: libdevel
