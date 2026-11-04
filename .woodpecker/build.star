@@ -230,7 +230,7 @@ def main(ctx):
         ),
 
         macos("macOS (Release, ARM)", "arm64"),
-        macos("macOS (Debug, ARM)", "arm64", cmake = {"CMAKE_BUILD_TYPE": "Debug"}, test_0rtt = False),
+        macos("macOS (Debug, ARM)", "arm64", cmake = {"CMAKE_BUILD_TYPE": "Debug"}),
         macos("macOS (Static, ARM)", "arm64", cmake = {"BUILD_STATIC_DEPS": True, "WITH_LTO": True}),
         macos("macOS (Release, Intel)", "amd64", cmake = {"LIBQUIC_BUILD_TESTS": False}, run_tests = False),
         macos(

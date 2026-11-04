@@ -738,9 +738,27 @@ namespace oxen::quic
         return friendly;
     }
 
-    std::shared_ptr<packet_delayer> packet_delayer::make(std::chrono::milliseconds delay)
+    std::shared_ptr<packet_delayer> packet_delayer::make(Loop& loop, std::chrono::milliseconds delay)
     {
-        return std::shared_ptr<packet_delayer>{new packet_delayer{delay}};
+        // The socket's events live on the loop's event base, so the delayer has to be destroyed on
+        // the loop thread while the loop is still alive.
+        return {new packet_delayer{delay}, [&loop](packet_delayer* p) {
+                    if (!loop.inside())
+                        return loop.call_get([p] { delete p; });
+
+                    // On the loop thread the last reference can be dropped from inside one of the
+                    // delayer's own socket callbacks, where destroying the socket isn't allowed, so
+                    // hand ownership to a job instead.  If the queue is stopped before the job runs,
+                    // dropping the job still deletes the delayer on the loop thread before the event
+                    // base is freed; if it is already stopped, `owner` deletes it right here.
+                    std::shared_ptr<packet_delayer> owner{p};
+                    try
+                    {
+                        loop.call_soon([owner] {});
+                    }
+                    catch (const std::exception&)
+                    {}
+                }};
     }
 
     void packet_delayer::init(std::shared_ptr<Endpoint> ep_)
