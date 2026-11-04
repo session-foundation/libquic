@@ -17,7 +17,7 @@ if(CCACHE_PROGRAM)
 endif()
 
 project(libquic
-    VERSION 1.13.0
+    VERSION 1.14.0
     DESCRIPTION "Modular QUIC library for stream and connection management"
     LANGUAGES ${LANGS})
 
@@ -84,6 +84,8 @@ add_library(libquic_external INTERFACE)
 # compilation, but not for potential external targets that depend on us.
 add_library(libquic_internal INTERFACE)
 
+configure_file(liboxenquic-utils.pc.in liboxenquic-utils.pc @ONLY)
+configure_file(liboxenquic-event.pc.in liboxenquic-event.pc @ONLY)
 configure_file(liboxenquic.pc.in liboxenquic.pc @ONLY)
 
 include(cmake/check_for_std_filesystem.cmake)
@@ -137,6 +139,8 @@ if(LIBQUIC_BUILD_TESTS OR LIBQUIC_BUILD_SPEEDTEST)
     add_subdirectory(tests)
 endif()
 
+add_library(oxen::quic-utils ALIAS quic-utils)
+add_library(oxen::quic-event ALIAS quic-event)
 add_library(oxen::quic ALIAS quic)
 
 if(LIBQUIC_INSTALL)
@@ -147,7 +151,10 @@ if(LIBQUIC_INSTALL)
     )
 
     install(
-        FILES ${CMAKE_CURRENT_BINARY_DIR}/liboxenquic.pc
+        FILES
+            ${CMAKE_CURRENT_BINARY_DIR}/liboxenquic-utils.pc
+            ${CMAKE_CURRENT_BINARY_DIR}/liboxenquic-event.pc
+            ${CMAKE_CURRENT_BINARY_DIR}/liboxenquic.pc
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
     )
 endif()

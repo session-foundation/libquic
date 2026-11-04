@@ -5,8 +5,6 @@
 
 #include <oxenc/endian.h>
 
-#include <ngtcp2/ngtcp2.h>
-
 #include <array>
 #include <cassert>
 #include <compare>
@@ -50,20 +48,19 @@ namespace oxen::quic
     template <typename T>
     concept raw_sockaddr = std::same_as<T, sockaddr> || std::same_as<T, sockaddr_in> || std::same_as<T, sockaddr_in6>;
 
-    // Holds an address, with a ngtcp2_addr held for easier passing into ngtcp2 functions
     struct Address
     {
         friend class TestHelper;
 
       private:
         sockaddr_storage _sock_addr{};
-        ngtcp2_addr _addr{reinterpret_cast<sockaddr*>(&_sock_addr), 0};
+        socklen_t _socklen = 0;
 
       protected:
         void _copy_internals(const Address& obj)
         {
             std::memcpy(&_sock_addr, &obj._sock_addr, sizeof(_sock_addr));
-            _addr.addrlen = obj._addr.addrlen;
+            _socklen = obj._socklen;
             dual_stack = obj.dual_stack;
         }
 
@@ -77,7 +74,7 @@ namespace oxen::quic
         Address(const sockaddr* s, socklen_t n)
         {
             std::memmove(&_sock_addr, s, n);
-            _addr.addrlen = n;
+            _socklen = n;
         }
         explicit Address(const sockaddr* s) :
                 Address{s, static_cast<socklen_t>(s->sa_family == AF_INET ? sizeof(sockaddr_in) : sizeof(sockaddr_in6))}
@@ -85,8 +82,6 @@ namespace oxen::quic
         explicit Address(const sockaddr_in* s) : Address{reinterpret_cast<const sockaddr*>(s), sizeof(sockaddr_in)} {}
         explicit Address(const sockaddr_in6* s) : Address{reinterpret_cast<const sockaddr*>(s), sizeof(sockaddr_in6)} {}
         Address(const std::string& addr, uint16_t port);
-
-        explicit Address(const ngtcp2_addr& addr);
 
         explicit Address(const ipv4& v4, uint16_t port = 0);
 
@@ -96,10 +91,9 @@ namespace oxen::quic
         template <raw_sockaddr T>
         Address& operator=(const T* s)
         {
-            _addr.addrlen = std::is_same_v<T, sockaddr>
-                                  ? s->sa_family == AF_INET ? sizeof(sockaddr_in) : sizeof(sockaddr_in6)
-                                  : sizeof(T);
-            std::memmove(&_sock_addr, s, _addr.addrlen);
+            _socklen = std::is_same_v<T, sockaddr> ? s->sa_family == AF_INET ? sizeof(sockaddr_in) : sizeof(sockaddr_in6)
+                                                   : sizeof(T);
+            std::memmove(&_sock_addr, s, _socklen);
             return *this;
         }
 
@@ -200,13 +194,12 @@ namespace oxen::quic
 
         inline bool is_ipv4() const
         {
-            return _addr.addrlen == sizeof(sockaddr_in) &&
-                   reinterpret_cast<const sockaddr_in&>(_sock_addr).sin_family == AF_INET;
+            return _socklen == sizeof(sockaddr_in) && reinterpret_cast<const sockaddr_in&>(_sock_addr).sin_family == AF_INET;
         }
 
         inline bool is_ipv6() const
         {
-            return _addr.addrlen == sizeof(sockaddr_in6) &&
+            return _socklen == sizeof(sockaddr_in6) &&
                    reinterpret_cast<const sockaddr_in6&>(_sock_addr).sin6_family == AF_INET6;
         }
 
@@ -256,16 +249,6 @@ namespace oxen::quic
             return reinterpret_cast<const T*>(&_sock_addr);
         }
 
-        // Conversion to a const ngtcp2_addr reference and pointer.  We don't provide non-const
-        // access because this points at our internal data.
-        operator const ngtcp2_addr&() const { return _addr; }
-        template <typename T>
-            requires std::same_as<T, ngtcp2_addr>
-        operator const T*() const
-        {
-            return &_addr;
-        }
-
         auto operator<=>(const Address& other) const
         {
             if (is_ipv4() && other.is_ipv4())
@@ -291,16 +274,16 @@ namespace oxen::quic
         bool operator==(const Address& other) const { return (*this <=> other) == 0; }
 
         // Returns the size of the sockaddr
-        socklen_t socklen() const { return _addr.addrlen; }
+        socklen_t socklen() const { return _socklen; }
 
         // Returns a pointer to the sockaddr size; typically you want this when updating the address
         // via a function like `getsockname`.
-        socklen_t* socklen_ptr() { return &_addr.addrlen; }
+        socklen_t* socklen_ptr() { return &_socklen; }
 
         // Updates the socklen of the sockaddr; this must be called if directly modifying the
         // address via one of the sockaddr* pointer operators.  (It is not needed when assigning a
         // sockaddr pointer).
-        void update_socklen(socklen_t len) { _addr.addrlen = len; }
+        void update_socklen(socklen_t len) { _socklen = len; }
 
         // Returns the "host" part of the address (i.e. the IP address) as a string.  For IPv6
         // addresses this does *not* include [ ], but note that in older versions of libquic it did.
@@ -349,58 +332,6 @@ namespace oxen::quic
         }
     };
 
-    // Wrapper for ngtcp2_path with remote/local components. Implicitly convertible
-    // to ngtcp2_path*
-    struct Path
-    {
-        friend class TestHelper;
-        friend class Connection;
-
-      public:
-        Address local;
-        Address remote;
-
-      private:
-        ngtcp2_path _path{local, remote, nullptr};
-
-        void set_new_remote(const ngtcp2_addr& new_remote);
-
-      public:
-        Path() = default;
-        Path(const Address& l, const Address& r) : local{l}, remote{r} {}
-        Path(const Path& p) : Path{p.local, p.remote} {}
-
-        Path& operator=(const Path& p)
-        {
-            local = p.local;
-            remote = p.remote;
-            _path.local = local;
-            _path.remote = remote;
-            return *this;
-        }
-
-        bool operator==(const Path& other) const { return std::tie(local, remote) == std::tie(other.local, other.remote); }
-
-        // template code to pass Path as ngtcp2_path into ngtcp2 functions
-        template <typename T>
-            requires std::same_as<T, ngtcp2_path>
-        operator T*()
-        {
-            return &_path;
-        }
-        template <typename T>
-            requires std::same_as<T, ngtcp2_path>
-        operator const T*() const
-        {
-            return &_path;
-        }
-
-        Path invert() const { return {remote, local}; }
-
-        std::string to_string() const;
-        constexpr static bool to_string_formattable = true;
-    };
-
     // Used for hash combining, below
     inline constexpr size_t inverse_golden_ratio = sizeof(size_t) >= 8 ? 0x9e37'79b9'7f4a'7c15 : 0x9e37'79b9;
 
@@ -443,17 +374,6 @@ namespace std
             auto vrk = addr.view_remote_key();
             size_t h = hash<std::string_view>{}(std::string_view{reinterpret_cast<const char*>(vrk.data()), vrk.size()});
             h ^= hash<oxen::quic::Address>{}(addr) + oxen::quic::inverse_golden_ratio + (h << 6) + (h >> 2);
-            return h;
-        }
-    };
-
-    template <>
-    struct hash<oxen::quic::Path>
-    {
-        size_t operator()(const oxen::quic::Path& addr) const noexcept
-        {
-            auto h = hash<oxen::quic::Address>{}(addr.local);
-            h ^= hash<oxen::quic::Address>{}(addr.remote) + oxen::quic::inverse_golden_ratio + (h << 6) + (h >> 2);
             return h;
         }
     };
