@@ -8,6 +8,7 @@
 #include "datagram.hpp"
 #include "loop.hpp"
 #include "opt.hpp"
+#include "path.hpp"
 #include "result.hpp"
 #include "udp.hpp"
 #include "utils.hpp"
@@ -122,8 +123,11 @@ namespace oxen::quic
         // something small (e.g. a keep-alive) is sent.
         //
         // An application can call this from the operating system's network change notifications
-        // (e.g. Android's ConnectivityManager.NetworkCallback, or Apple's NWPathMonitor).  It may be
-        // called from any thread, and is cheap and harmless when nothing has actually changed.
+        // (e.g. Android's ConnectivityManager.NetworkCallback).  It may be called from any thread,
+        // and is cheap and harmless when nothing has actually changed.  On Apple platforms libquic
+        // calls it itself, from its own watch on the network, once the endpoint has made an outbound
+        // connection: there a change can also mean IPv4 peers have to be reached through the
+        // network's NAT64 (or no longer are), which a connection can't otherwise notice.
         void network_changed();
 
         const Address& local() const { return _local; }
@@ -297,6 +301,9 @@ namespace oxen::quic
         /// If the socket has no buffer space (ENOBUFS), the remaining packets are dropped.  Either
         /// way the send still counts as a success: QUIC treats the dropped packets as lost.
         ///
+        /// If there is no route to the peer (`.unreachable()`), the remaining packets are likewise
+        /// dropped, but the error is returned, so that the connection can look for another route.
+        ///
         /// If a more serious error occurs (other than a blocked socket) then `n_pkts` is set to 0
         /// (effectively dropping all packets) and a result is returned with `.failure()` true (and
         /// `.blocked()` false).
@@ -312,6 +319,33 @@ namespace oxen::quic
         // The local address our socket would currently use to reach `remote` (see
         // UDPSocket::local_address_for), or nullopt if that can't be determined.
         std::optional<Address> local_address_for(const Address& remote) const;
+
+        // How the host would now reach `remote`: the local address it would send from, and, only
+        // for an IPv4 peer on an Apple device with no IPv4 route to it, the network's NAT64 address
+        // for it, to send to instead; nullopt if there is no route at all.
+        std::optional<Connection::route> route_to(const Address& remote);
+
+#ifdef __APPLE__
+        // The network's NAT64 address for the IPv4-mapped `remote`, if the network has a NAT64.
+        std::optional<Address> nat64_address(const Address& remote);
+
+        // The host's network's NAT64 prefix, looked up the first time nat64_address() needs it after
+        // each network change.  The system learns a network's prefix a moment after joining it, and
+        // nothing announces that, so a lookup that finds none is repeated once a short while has
+        // passed since the last one.
+        std::optional<ipv6_range> _nat64_prefix;
+        std::chrono::steady_clock::time_point _nat64_checked;
+
+        // Watches the host's network, calling network_changed() on each change; started by the
+        // first outbound connection.  Opaque here to keep Network.framework out of this header.
+        struct network_monitor;
+        struct network_monitor_deleter
+        {
+            void operator()(network_monitor* m) const;
+        };
+        std::unique_ptr<network_monitor, network_monitor_deleter> _network_monitor;
+        void watch_network();
+#endif
 
         send_batch& batch() { return *_send_batch; }
 

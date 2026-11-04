@@ -78,7 +78,9 @@ namespace oxen::quic
         conn._endpoint.set_local(new_addr);
 
         current_sock.swap(new_sock);
-        ngtcp2_conn_set_local_addr(conn, &new_addr._addr);
+        Address local{new_addr};
+        auto local_ref = ngtcp2_addr_ref(local);
+        ngtcp2_conn_set_local_addr(conn, &local_ref);
     }
 
     Connection* TestHelper::get_conn(std::shared_ptr<Endpoint>& ep, std::shared_ptr<Connection>& _conn)
@@ -131,7 +133,10 @@ namespace oxen::quic
 
     Address TestHelper::ngtcp2_path_remote(Connection& conn)
     {
-        return conn._endpoint.job_queue.call_get([&] { return Address{ngtcp2_conn_get_path(conn)->remote}; });
+        return conn._endpoint.job_queue.call_get([&] {
+            auto& remote = ngtcp2_conn_get_path(conn)->remote;
+            return Address{remote.addr, remote.addrlen};
+        });
     }
 
     size_t TestHelper::route_lookups(Endpoint& ep)
@@ -146,7 +151,10 @@ namespace oxen::quic
 
     Address TestHelper::ngtcp2_path_local(Connection& conn)
     {
-        return conn._endpoint.job_queue.call_get([&] { return Address{ngtcp2_conn_get_path(conn)->local}; });
+        return conn._endpoint.job_queue.call_get([&] {
+            auto& local = ngtcp2_conn_get_path(conn)->local;
+            return Address{local.addr, local.addrlen};
+        });
     }
 
     bool TestHelper::fail_socket_sends(Endpoint& ep, std::vector<int> gso_errors, std::vector<int> plain_errors)
@@ -730,9 +738,27 @@ namespace oxen::quic
         return friendly;
     }
 
-    std::shared_ptr<packet_delayer> packet_delayer::make(std::chrono::milliseconds delay)
+    std::shared_ptr<packet_delayer> packet_delayer::make(Loop& loop, std::chrono::milliseconds delay)
     {
-        return std::shared_ptr<packet_delayer>{new packet_delayer{delay}};
+        // The socket's events live on the loop's event base, so the delayer has to be destroyed on
+        // the loop thread while the loop is still alive.
+        return {new packet_delayer{delay}, [&loop](packet_delayer* p) {
+                    if (!loop.inside())
+                        return loop.call_get([p] { delete p; });
+
+                    // On the loop thread the last reference can be dropped from inside one of the
+                    // delayer's own socket callbacks, where destroying the socket isn't allowed, so
+                    // hand ownership to a job instead.  If the queue is stopped before the job runs,
+                    // dropping the job still deletes the delayer on the loop thread before the event
+                    // base is freed; if it is already stopped, `owner` deletes it right here.
+                    std::shared_ptr<packet_delayer> owner{p};
+                    try
+                    {
+                        loop.call_soon([owner] {});
+                    }
+                    catch (const std::exception&)
+                    {}
+                }};
     }
 
     void packet_delayer::init(std::shared_ptr<Endpoint> ep_)

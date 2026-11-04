@@ -2,13 +2,7 @@
 
 // IWYU pragma: begin_exports
 #include "address.hpp"
-#include "format.hpp"
-#include "utils.hpp"
-
-#include <oxen/log.hpp>
-#include <oxen/log/format.hpp>
-
-#include <fmt/format.h>
+#include "utils_internal.hpp"
 
 #include <array>
 #include <chrono>
@@ -26,12 +20,6 @@ extern "C"
 
 namespace oxen::quic
 {
-    inline auto log_cat = oxen::log::Cat("quic");
-
-    namespace log = oxen::log;
-
-    using namespace log::literals;
-
     inline constexpr size_t MAX_BATCH =
 #if defined(OXEN_LIBQUIC_UDP_SENDMMSG) || defined(OXEN_LIBQUIC_UDP_GSO)
             DATAGRAM_BATCH_SIZE;
@@ -65,10 +53,12 @@ namespace oxen::quic
         // Connections that tried to flush during a stall, to be woken (in order) once it clears.
         std::vector<Connection*> waiters;
 
-        // Packets dropped because they were too large for their path, or because a local queue had
-        // no room for them (used to rate-limit their logging).
+        // Packets dropped because they were too large for their path, because a local queue had no
+        // room for them, or because there was no route to their destination (used to rate-limit
+        // their logging).
         size_t too_big_drops = 0;
         size_t no_buffer_drops = 0;
+        size_t unreachable_drops = 0;
 
 #ifndef NDEBUG
         // Set for the duration of a flush, to catch a flush starting inside another one.
@@ -110,14 +100,6 @@ namespace oxen::quic
         size_t debug_stall_discards = 0;
 #endif
     };
-
-    inline timeval loop_time_to_timeval(std::chrono::microseconds t)
-    {
-        timeval tv;
-        tv.tv_sec = t / 1s;
-        tv.tv_usec = (t % 1s) / 1us;
-        return tv;
-    }
 
     // ngtcp2's timestamps are steady clock times in nanoseconds.
     inline uint64_t ngtcp2_ts(time_point t)

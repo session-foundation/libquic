@@ -153,7 +153,7 @@ def macos(name, arch, cmake = {}, run_tests = True, test_0rtt = True, jobs = 6):
         ] + build_commands(cmake, jobs, run_tests, test_0rtt, gdb = False),
     }])
 
-bookworm_ngtcp2 = backports("bookworm", ngtcp2_deps)
+#bookworm_ngtcp2 = backports("bookworm", ngtcp2_deps)
 
 def main(ctx):
     return [
@@ -185,7 +185,7 @@ def main(ctx):
         linux("Debian testing (i386)", "debian-testing/i386"),
         linux("Debian 13 static", "debian-trixie", deps = ["g++"], cmake = {"BUILD_STATIC_DEPS": True}),
         linux("Debian 13 (i386)", "debian-trixie/i386"),
-        linux("Debian 12", "debian-bookworm", setup = bookworm_ngtcp2),
+        linux("Debian 12", "debian-bookworm", setup = session_repo),
         linux(
             "Debian 12 static Debug",
             "debian-bookworm",
@@ -210,11 +210,11 @@ def main(ctx):
             "debian-bookworm",
             arch = "arm64",
             jobs = 4,
-            setup = bookworm_ngtcp2,
+            setup = session_repo,
             cmake = {"CMAKE_BUILD_TYPE": "Debug"},
             test_0rtt = False,
         ),
-        linux("Debian 12 (armhf)", "debian-bookworm/arm32v7", arch = "arm64", jobs = 4, setup = bookworm_ngtcp2),
+        linux("Debian 12 (armhf)", "debian-bookworm/arm32v7", arch = "arm64", jobs = 4, setup = session_repo),
 
         # The tests are built, but not run.
         linux(
@@ -230,7 +230,7 @@ def main(ctx):
         ),
 
         macos("macOS (Release, ARM)", "arm64"),
-        macos("macOS (Debug, ARM)", "arm64", cmake = {"CMAKE_BUILD_TYPE": "Debug"}, test_0rtt = False),
+        macos("macOS (Debug, ARM)", "arm64", cmake = {"CMAKE_BUILD_TYPE": "Debug"}),
         macos("macOS (Static, ARM)", "arm64", cmake = {"BUILD_STATIC_DEPS": True, "WITH_LTO": True}),
         macos("macOS (Release, Intel)", "amd64", cmake = {"LIBQUIC_BUILD_TESTS": False}, run_tests = False),
         macos(
