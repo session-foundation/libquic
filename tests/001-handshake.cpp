@@ -57,8 +57,10 @@ namespace oxen::quic::test
             CHECK(empty_addr == Address{"::", 0});
             CHECK(good_addr.is_set());
 
-            CHECK(Address{static_cast<const ngtcp2_addr&>(good_addr)} == good_addr);
-            CHECK(Address{static_cast<const ngtcp2_addr&>(public_ipv6)} == public_ipv6);
+            auto good_ref = ngtcp2_addr_ref(good_addr);
+            CHECK(Address{good_ref.addr, good_ref.addrlen} == good_addr);
+            auto public_ipv6_ref = ngtcp2_addr_ref(public_ipv6);
+            CHECK(Address{public_ipv6_ref.addr, public_ipv6_ref.addrlen} == public_ipv6);
 
             CHECK(empty_addr.is_any_addr());
 #ifndef OXEN_QUIC_ADDRESS_NO_DUAL_STACK
@@ -127,6 +129,19 @@ namespace oxen::quic::test
             CHECK(public_ipv6.is_addressable());
             CHECK_FALSE(public_ipv6.is_loopback());
 
+            CHECK(ipv4(1, 2, 3, 4).is_public());
+            CHECK_FALSE(ipv4(10, 1, 2, 3).is_public());
+            CHECK_FALSE(ipv4(198, 51, 100, 7).is_public());
+            CHECK(ipv6(0x2345, 0, 0, 0, 0, 0, 0, 1).is_public());
+            CHECK_FALSE(ipv6(0xfdab, 0x1234, 5, 0, 0, 0, 0, 1).is_public());
+
+            Address mapped_public{"::ffff:1.2.3.4", 0};
+            CHECK(mapped_public.is_public_ip());
+            CHECK_FALSE(mapped_public.is_public());
+            Address mapped_loopback{"::ffff:127.0.0.1", 80};
+            CHECK(mapped_loopback.is_loopback());
+            CHECK_FALSE(mapped_loopback.is_public_ip());
+
             CHECK(Address{"127.0.0.1", 2} < Address{"127.0.0.1", 256});
             CHECK(Address{"127.0.0.1", 256} < Address{"127.0.0.2", 2});
             CHECK(Address{"127.0.0.1", 256} < public_ipv6);
@@ -152,6 +167,12 @@ namespace oxen::quic::test
             CHECK((ipv4(10, 255, 255, 255) % 8).contains(ipv4(10, 123, 123, 123)));
             CHECK_FALSE((ipv4(10, 0, 0, 0) % 8).contains(ipv4(11, 0, 0, 0)));
             CHECK_FALSE((ipv4(10, 0, 0, 0) % 8).contains(ipv4(9, 255, 255, 255)));
+            CHECK((ipv4(10, 1, 2, 3) / 0).ip == ipv4{});
+            CHECK((ipv4(10, 1, 2, 3) / 0).contains(ipv4(200, 1, 2, 3)));
+            CHECK((ipv6(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1) / 0).contains(ipv6(0xfe80, 0, 0, 0, 0, 0, 0, 1)));
+
+            CHECK(ipv4(1, 2, 3, 4) == static_cast<in_addr>(ipv4(1, 2, 3, 4)));
+            CHECK_FALSE(ipv4(4, 3, 2, 1) == static_cast<in_addr>(ipv4(1, 2, 3, 4)));
 
             CHECK((ipv6(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0) / 32).contains(ipv6(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0)));
             CHECK((ipv6(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0) / 32).contains(ipv6(0x2001, 0xdb8, 0xffff, 0xffff, 0, 0, 0, 0)));

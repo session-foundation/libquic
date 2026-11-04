@@ -1,6 +1,7 @@
 #pragma once
 
 #include "address.hpp"
+#include "path.hpp"
 
 #include <algorithm>
 #include <bit>

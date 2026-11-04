@@ -47,6 +47,8 @@ if(LIBQUIC_BUILD_TESTS)
         019-socket-buffers.cpp
         020-congestion-control.cpp
         021-flow-control.cpp
+        022-request-withdrawal.cpp
+        023-dual-stack-bind.cpp
         job-queue.cpp
 
         case_logger.cpp
