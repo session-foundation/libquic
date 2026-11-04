@@ -15,8 +15,6 @@
 #include <type_traits>
 #include <vector>
 
-struct event;
-
 namespace oxen::quic
 {
 
@@ -228,12 +226,5 @@ namespace oxen::quic
         value = tmp;
         return true;
     }
-
-    struct event_deleter final
-    {
-        void operator()(::event* e) const;
-    };
-
-    using event_ptr = std::unique_ptr<::event, event_deleter>;
 
 }  // namespace oxen::quic

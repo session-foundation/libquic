@@ -10,51 +10,82 @@ session_dep(gnutls 3.7.2)
 session_dep(nettle 3.5)
 session_dep(libevent_core 2.1 WITH libevent_pthreads)
 
-add_library(quic
+# Address/IP types and general utilities, usable without pulling in libevent or ngtcp2.
+add_library(quic-utils
     address.cpp
+    format.cpp
+    ip.cpp
+    utils.cpp
+    ${CMAKE_CURRENT_BINARY_DIR}/version.cpp
+)
+
+target_link_libraries(quic-utils
+    PUBLIC
+    oxen::logging
+    libquic_external
+    oxenc::oxenc
+    PRIVATE
+    libquic_internal
+)
+
+# The libevent-based event loop and job queue.
+add_library(quic-event
+    loop.cpp
+)
+
+target_link_libraries(quic-event
+    PUBLIC
+    quic-utils
+    sessiondep::libevent_core sessiondep::libevent_pthreads
+    PRIVATE
+    libquic_internal
+)
+
+add_library(quic
     btstream.cpp
     connection.cpp
     connection_ids.cpp
     context.cpp
     datagram.cpp
     endpoint.cpp
-    format.cpp
     gnutls_crypto.cpp
     iochannel.cpp
-    ip.cpp
-    loop.cpp
     network.cpp
+    path.cpp
     result.cpp
     stream.cpp
     udp.cpp
     unencrypted.cpp
-    utils.cpp
-    ${CMAKE_CURRENT_BINARY_DIR}/version.cpp
 )
 
 target_link_libraries(quic
     PUBLIC
+    quic-event
     sessiondep::libngtcp2
     sessiondep::libngtcp2_crypto_gnutls
     sessiondep::gnutls
-    oxen::logging
-    libquic_external
-    oxenc::oxenc
-    sessiondep::libevent_core sessiondep::libevent_pthreads
     PRIVATE
     libquic_internal
     sessiondep::nettle
 )
 
-target_compile_features(quic INTERFACE cxx_std_20)
+target_compile_features(quic-utils INTERFACE cxx_std_20)
 
+set_target_properties(quic-utils PROPERTIES LIBRARY_OUTPUT_NAME oxenquic-utils)
+set_target_properties(quic-event PROPERTIES LIBRARY_OUTPUT_NAME oxenquic-event)
 set_target_properties(quic PROPERTIES LIBRARY_OUTPUT_NAME oxenquic)
 if(LIBQUIC_VERSION_SO)
-    set_target_properties(quic PROPERTIES SOVERSION ${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR})
+    set_target_properties(quic-utils quic-event quic PROPERTIES
+        SOVERSION ${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR})
 endif()
 
 if(WIN32)
-    target_link_libraries(quic PUBLIC ws2_32)
+    target_link_libraries(quic-utils PUBLIC ws2_32)
+endif()
+
+if(APPLE)
+    # For the endpoint's watch on the host's network (see Endpoint::watch_network)
+    target_link_libraries(quic PUBLIC "-framework Network")
 endif()
 
 if(BUILD_STATIC_DEPS AND MINGW)
@@ -95,7 +126,7 @@ endif()
 
 if(LIBQUIC_INSTALL)
     install(
-        TARGETS quic
+        TARGETS quic-utils quic-event quic
         EXPORT oxenquicConfig
         DESTINATION ${CMAKE_INSTALL_LIBDIR}
     )

@@ -1,6 +1,6 @@
 #include "address.hpp"
 
-#include "internal.hpp"
+#include "utils_internal.hpp"
 
 #include <oxenc/endian.h>
 
@@ -24,7 +24,7 @@ namespace oxen::quic
             _sock_addr.ss_family = AF_INET6;
             auto& sin6 = reinterpret_cast<sockaddr_in6&>(_sock_addr);
             sin6.sin6_port = oxenc::host_to_big(port);
-            _addr.addrlen = sizeof(sockaddr_in6);
+            _socklen = sizeof(sockaddr_in6);
             if (!addr.empty())
                 detail::parse_addr(sin6.sin6_addr, addr);
             else
@@ -36,20 +36,12 @@ namespace oxen::quic
             _sock_addr.ss_family = AF_INET;
             auto& sin4 = reinterpret_cast<sockaddr_in&>(_sock_addr);
             sin4.sin_port = oxenc::host_to_big(port);
-            _addr.addrlen = sizeof(sockaddr_in);
+            _socklen = sizeof(sockaddr_in);
 #ifdef OXEN_LIBQUIC_ADDRESS_NO_DUAL_STACK
             if (!addr.empty())
 #endif
                 detail::parse_addr(sin4.sin_addr, addr);
         }
-    }
-
-    Address::Address(const ngtcp2_addr& addr)
-    {
-        if (addr.addr->sa_family != AF_INET6 && addr.addr->sa_family != AF_INET)
-            throw std::invalid_argument{"What on earth did you pass to this constructor?"};
-        std::memcpy(&_sock_addr, addr.addr, addr.addrlen);
-        update_socklen(addr.addrlen);
     }
 
     Address::Address(const ipv4& v4, uint16_t port)
@@ -144,23 +136,11 @@ namespace oxen::quic
         if (is_any_addr())
             return false;
         if (is_ipv4())
-        {
-            ipv4 addr{oxenc::big_to_host<uint32_t>(in4().sin_addr.s_addr)};
-            for (const auto& range : ipv4_nonpublic)
-                if (range.contains(addr))
-                    return false;
-        }
-        else if (is_ipv4_mapped_ipv6())
-        {
-            return unmapped_ipv4_from_ipv6().is_public();
-        }
-        else if (is_ipv6())
-        {
-            ipv6 addr{in6().sin6_addr};
-            for (const auto& range : ipv6_nonpublic)
-                if (range.contains(addr))
-                    return false;
-        }
+            return to_ipv4().is_public();
+        if (is_ipv4_mapped_ipv6())
+            return unmapped_ipv4_from_ipv6().to_ipv4().is_public();
+        if (is_ipv6())
+            return to_ipv6().is_public();
         return true;
     }
 
@@ -176,7 +156,7 @@ namespace oxen::quic
         if (is_ipv4())
             return ipv4_loopback.contains(ipv4{in4().sin_addr});
         if (is_ipv4_mapped_ipv6())
-            return unmapped_ipv4_from_ipv6().is_public();
+            return unmapped_ipv4_from_ipv6().is_loopback();
         if (is_ipv6())
             return ipv6{in6().sin6_addr} == ipv6_loopback;
         return false;
@@ -207,18 +187,6 @@ namespace oxen::quic
         if (is_ipv6())
             return "[{}]:{}"_format(host(), port());
         return "{}:{}"_format(host(), port());
-    }
-
-    void Path::set_new_remote(const ngtcp2_addr& new_remote)
-    {
-        memcpy(_path.remote.addr, new_remote.addr, new_remote.addrlen);
-        _path.remote.addrlen = new_remote.addrlen;
-        remote = Address{_path.remote.addr, _path.remote.addrlen};
-    }
-
-    std::string Path::to_string() const
-    {
-        return "{{{} ➙ {}}}"_format(local, remote);
     }
 
     Address Address::parse(std::string_view addr, std::optional<uint16_t> default_port)

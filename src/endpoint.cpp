@@ -34,8 +34,49 @@ extern "C"
 }
 #endif
 
+#ifdef __APPLE__
+#include <dispatch/dispatch.h>
+#include <Network/Network.h>
+
+extern "C"
+{
+#include <netdb.h>
+}
+#endif
+
 namespace oxen::quic
 {
+#ifdef __APPLE__
+    // On an IPv6-only network, Apple's platforms reach IPv4 hosts through the network's NAT64, but
+    // only at IPv6 addresses carrying the network's NAT64 prefix: unlike Android, they don't
+    // translate an app's own IPv4 (or IPv4-mapped) destinations, sends to which fail with "Network
+    // is unreachable".  getaddrinfo() given an IPv4 address string returns the NAT64 address for it
+    // on such a network (which is Apple's documented way to get one), and the IPv4 address itself
+    // anywhere else, so this returns nullopt unless the network has a NAT64.
+    static std::optional<ipv6> nat64_lookup(const ipv4& addr)
+    {
+        addrinfo hints{};
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_DGRAM;
+        hints.ai_flags = AI_DEFAULT;
+        addrinfo* res = nullptr;
+        if (getaddrinfo(addr.to_string().c_str(), nullptr, &hints, &res) != 0)
+            return std::nullopt;
+
+        std::optional<ipv6> nat64;
+        for (auto* ai = res; ai; ai = ai->ai_next)
+        {
+            if (ai->ai_family == AF_INET6)
+            {
+                nat64.emplace(reinterpret_cast<const sockaddr_in6*>(ai->ai_addr)->sin6_addr);
+                break;
+            }
+        }
+        freeaddrinfo(res);
+        return nat64;
+    }
+#endif
+
     void Endpoint::handle_ep_opt(opt::enable_datagrams dc)
     {
         _datagrams = true;
@@ -188,12 +229,18 @@ namespace oxen::quic
 
     std::shared_ptr<Connection> Endpoint::_connect(RemoteAddress remote, std::shared_ptr<IOContext> ctx)
     {
+#ifdef __APPLE__
+        // Without a socket (manual routing) the host's network isn't ours to follow.
+        if (!_network_monitor && socket)
+            watch_network();
+#endif
+
         // Labelling the path with the source address the host's routing actually uses (rather than
         // an any-address bind) means a change of that address is a change of path.
-        Address local = _local;
-        if (auto source = local_address_for(remote))
-            local = *source;
-        Path path{local, std::move(remote)};
+        auto to = route_to(remote);
+        if (to && to->nat64)
+            log::debug(log_cat, "Connecting to {} through NAT64 at {}", remote, *to->nat64);
+        Path path{to ? to->local : _local, std::move(remote)};
 
         auto rid = next_reference_id();
 
@@ -213,6 +260,7 @@ namespace oxen::quic
                             it_a->first,
                             quic_cid::random(),
                             std::move(path),
+                            to ? to->nat64 : std::nullopt,
                             ctx,
                             alpns,
                             ctx->config.handshake_timeout.value_or(handshake_timeout),
@@ -242,6 +290,10 @@ namespace oxen::quic
     void Endpoint::network_changed()
     {
         job_queue.call([this] {
+#ifdef __APPLE__
+            _nat64_prefix.reset();
+            _nat64_checked = {};
+#endif
             for (const auto& [rid, conn] : conns)
             {
                 if (!conn->is_outbound())
@@ -252,6 +304,37 @@ namespace oxen::quic
             }
         });
     }
+
+#ifdef __APPLE__
+    // Wrapped, rather than the endpoint holding an nw_path_monitor_t, because what that type is
+    // depends on how the including code is compiled: a struct pointer in C++, an Objective-C
+    // object under Objective-C++ (as some consumers of endpoint.hpp are).  Our own type keeps
+    // Network.framework out of the header.
+    struct Endpoint::network_monitor
+    {
+        nw_path_monitor_t monitor;
+    };
+
+    void Endpoint::network_monitor_deleter::operator()(network_monitor* m) const
+    {
+        nw_path_monitor_cancel(m->monitor);
+        nw_release(m->monitor);
+        delete m;
+    }
+
+    void Endpoint::watch_network()
+    {
+        auto monitor = nw_path_monitor_create();
+        nw_path_monitor_set_queue(monitor, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+        std::weak_ptr<Endpoint> wself = weak_from_this();
+        nw_path_monitor_set_update_handler(monitor, ^(nw_path_t) {
+          if (auto self = wself.lock())
+              self->network_changed();
+        });
+        nw_path_monitor_start(monitor);
+        _network_monitor.reset(new network_monitor{monitor});
+    }
+#endif
 
     std::list<std::shared_ptr<Connection>> Endpoint::get_all_conns(std::optional<Direction> d)
     {
@@ -410,6 +493,11 @@ namespace oxen::quic
             // you could have something arrive on IP2 but reply on IP1, which the remote side will
             // not accept).
             pkt.path.local = cptr->_path.local;
+
+            // Likewise a reply through NAT64 comes from the peer's NAT64 address, which ngtcp2
+            // doesn't know the peer by.
+            if (cptr->_nat64_path && pkt.path.remote == cptr->_nat64_path->remote)
+                pkt.path.remote = cptr->_path.remote;
         }
 
         cptr->handle_conn_packet(std::move(pkt));
@@ -560,7 +648,7 @@ namespace oxen::quic
         // cleanup scheduled just above is on a timer that does not wait for that: it can fire, and
         // destroy the connection, first.  Hence the id-and-lookup rather than capturing `conn`.
         send_or_queue_packet(
-                conn.path(),
+                conn.send_path(),
                 std::move(buf),
                 /*ecn=*/0,
                 !conn.is_outbound(),
@@ -1065,6 +1153,7 @@ namespace oxen::quic
                             it_a->first,
                             hdr.scid,
                             pkt.path,
+                            std::nullopt,
                             inbound_ctx,
                             inbound_alpns,
                             handshake_timeout,
@@ -1263,6 +1352,15 @@ namespace oxen::quic
                 return io_result{};
             }
 
+            if (ret.unreachable())
+            {
+                // Likewise the rest would fail too, and the connection carries on without them, but
+                // it needs to know, to look for another route (see Connection::send_unreachable).
+                count_drops(batch().unreachable_drops, n_pkts, "no route to the destination", path);
+                n_pkts = 0;
+                return ret;
+            }
+
             if (ret.failure())
             {
                 log::error(log_cat, "Error sending packets {}: {}", path, ret.str_error());
@@ -1328,17 +1426,26 @@ namespace oxen::quic
         // (closing or draining) cleared itself from `owner` already.
         if (owner && !owner->dead)
         {
+            const auto ts = get_timestamp().count();
             size_t too_big = 0;
             auto rv = send_packets(
-                    owner->_path, b.buf.data(), b.size.data(), b.ecn.data(), b.n_packets, !owner->is_outbound(), &too_big);
+                    owner->send_path(),
+                    b.buf.data(),
+                    b.size.data(),
+                    b.ecn.data(),
+                    b.n_packets,
+                    !owner->is_outbound(),
+                    &too_big);
             if (too_big)
-                owner->packet_too_big(too_big, get_timestamp().count());
+                owner->packet_too_big(too_big, ts);
             if (rv.blocked())
             {
                 socket->when_writeable([this] { resume_stalled_send(); });
                 return;
             }
-            if (rv.failure())
+            if (rv.unreachable())
+                owner->send_unreachable(ts);
+            else if (rv.failure())
             {
                 log::warning(log_cat, "Error while trying to send packet: {}", rv.str_error());
                 drop_connection(*owner, io_error{CONN_SEND_FAIL});
@@ -1408,6 +1515,59 @@ namespace oxen::quic
             return std::nullopt;
         return socket->local_address_for(remote);
     }
+
+    std::optional<Connection::route> Endpoint::route_to(const Address& remote)
+    {
+        if (auto source = local_address_for(remote))
+            return Connection::route{std::move(*source), std::nullopt};
+#ifdef __APPLE__
+        // NAT64 only when there is no IPv4 route to the peer: where there is one, even through a
+        // VPN, the IPv4 address is how to reach it, and getaddrinfo() has been seen to return the
+        // NAT64 address even while a VPN provides IPv4, which would send traffic around the VPN.
+        if (socket && remote.is_ipv4_mapped_ipv6())
+            if (auto nat64 = nat64_address(remote))
+                if (auto nat64_source = local_address_for(*nat64))
+                    return Connection::route{std::move(*nat64_source), std::move(nat64)};
+#endif
+        return std::nullopt;
+    }
+
+#ifdef __APPLE__
+    // How long finding no NAT64 holds before being looked up again (see Endpoint::_nat64_prefix).
+    static constexpr auto NAT64_RETRY = 2s;
+
+    std::optional<Address> Endpoint::nat64_address(const Address& remote)
+    {
+        if (!_nat64_prefix)
+        {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - _nat64_checked < NAT64_RETRY)
+                return std::nullopt;
+            _nat64_checked = now;
+
+            // getaddrinfo() can block, so rather than asking it for each peer (on every network
+            // change, failed send, and so on), it is asked once per network, for the prefix.  It is
+            // asked about the address Apple's documentation uses for this, rather than a peer's, so
+            // that what it finds doesn't depend on which peer happened to ask first.
+            constexpr ipv4 probe{192, 0, 2, 1};
+            auto embedded = nat64_lookup(probe);
+            if (!embedded)
+            {
+                log::debug(log_cat, "The host's network has no NAT64 (yet)");
+                return std::nullopt;
+            }
+            _nat64_prefix = nat64_prefix(*embedded, probe);
+            if (!_nat64_prefix)
+            {
+                log::debug(log_cat, "{}'s NAT64 address {} has no RFC 6052 prefix; ignoring it", probe, *embedded);
+                return std::nullopt;
+            }
+            log::debug(log_cat, "The host's network has a NAT64, with prefix {}", *_nat64_prefix);
+        }
+
+        return Address{nat64_embed(*_nat64_prefix, remote.unmapped_ipv4_from_ipv6().to_ipv4()), remote.port()};
+    }
+#endif
 
     bool Endpoint::_debug_simulate_route_source([[maybe_unused]] std::optional<Address> addr)
     {

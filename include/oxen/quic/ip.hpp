@@ -6,6 +6,7 @@
 #include <limits>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 
@@ -96,9 +97,16 @@ namespace oxen::quic
 
         constexpr bool operator==(const ipv4& a) const { return (addr <=> a.addr) == 0; }
 
-        constexpr bool operator==(const in_addr& a) const { return (addr <=> a.s_addr) == 0; }
+        constexpr bool operator==(const in_addr& a) const { return addr == oxenc::big_to_host(a.s_addr); }
 
-        constexpr ipv4 to_base(uint8_t mask) const { return mask < 32 ? ipv4{(addr >> (32 - mask)) << (32 - mask)} : *this; }
+        constexpr ipv4 to_base(uint8_t mask) const
+        {
+            return mask == 0 ? ipv4{} : mask < 32 ? ipv4{(addr >> (32 - mask)) << (32 - mask)} : *this;
+        }
+
+        /// Returns true if this address is publicly routable, i.e. not within any of the
+        /// `ipv4_nonpublic` ranges.
+        constexpr bool is_public() const;
 
         std::string to_string() const;
         constexpr static bool to_string_formattable = true;
@@ -186,11 +194,15 @@ namespace oxen::quic
             }
             else
             {
-                b.hi = (hi >> (64 - mask)) << (64 - mask);
+                b.hi = mask == 0 ? uint64_t{0} : (hi >> (64 - mask)) << (64 - mask);
                 b.lo = uint64_t{0};
             }
             return b;
         }
+
+        /// Returns true if this address is publicly routable, i.e. not within any of the
+        /// `ipv6_nonpublic` ranges.
+        constexpr bool is_public() const;
 
         std::string to_string() const;
         constexpr static bool to_string_formattable = true;
@@ -379,6 +391,71 @@ namespace oxen::quic
             ipv6(0xfe80) / 10,                 // link-local unicast addressing
             ipv6(0xff00) / 8,                  // Multicast
     };
+
+    constexpr bool ipv4::is_public() const
+    {
+        for (const auto& range : ipv4_nonpublic)
+            if (range.contains(*this))
+                return false;
+        return true;
+    }
+
+    constexpr bool ipv6::is_public() const
+    {
+        for (const auto& range : ipv6_nonpublic)
+            if (range.contains(*this))
+                return false;
+        return true;
+    }
+
+    // NAT64 (RFC 6052) translates between IPv4 addresses and IPv6 addresses embedding one after the
+    // NAT64's prefix.
+
+    namespace detail
+    {
+        // Which bytes of an IPv6 address hold the four bytes of the IPv4 address it embeds after a
+        // prefix of `bits`, or nullopt if that isn't one of RFC 6052's prefix lengths.  They follow
+        // the prefix, but skip byte 8, which RFC 6052 reserves.
+        constexpr std::optional<std::array<int, 4>> nat64_ipv4_bytes(uint8_t bits)
+        {
+            if (bits != 32 && bits != 40 && bits != 48 && bits != 56 && bits != 64 && bits != 96)
+                return std::nullopt;
+            std::array<int, 4> pos{};
+            int p = bits / 8;
+            for (auto& i : pos)
+            {
+                if (p == 8)
+                    p++;
+                i = p++;
+            }
+            return pos;
+        }
+    }  // namespace detail
+
+    // `addr` embedded after the NAT64 prefix `prefix`, whose length must be 32, 40, 48, 56, 64 or 96.
+    constexpr ipv6 nat64_embed(const ipv6_range& prefix, const ipv4& addr)
+    {
+        auto pos = detail::nat64_ipv4_bytes(prefix.mask);
+        if (!pos)
+            throw std::invalid_argument{"NAT64 prefix length must be 32, 40, 48, 56, 64 or 96"};
+        ipv6 a = prefix.ip;
+        for (int i = 0; i < 4; i++)
+        {
+            const int byte = (*pos)[i];
+            (byte < 8 ? a.hi : a.lo) |= uint64_t{(addr.addr >> (24 - 8 * i)) & 0xff} << (56 - 8 * (byte % 8));
+        }
+        return a;
+    }
+
+    // The NAT64 prefix after which `embedded` embeds `addr`, or nullopt if it doesn't.  Should more
+    // than one prefix length fit, the longest wins, /96 being by far the most used.
+    constexpr std::optional<ipv6_range> nat64_prefix(const ipv6& embedded, const ipv4& addr)
+    {
+        for (uint8_t bits : std::array<uint8_t, 6>{96, 64, 56, 48, 40, 32})
+            if (auto prefix = embedded / bits; nat64_embed(prefix, addr) == embedded)
+                return prefix;
+        return std::nullopt;
+    }
 
     namespace detail
     {
