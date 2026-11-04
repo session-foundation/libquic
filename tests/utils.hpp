@@ -3,9 +3,24 @@
 // IWYU pragma: begin_exports
 #include <oxen/log.hpp>
 #include <oxen/log/format.hpp>
-#include <oxen/quic.hpp>
+#include <oxen/quic/address.hpp>
+#include <oxen/quic/btstream.hpp>
+#include <oxen/quic/connection.hpp>
+#include <oxen/quic/connection_ids.hpp>
+#include <oxen/quic/crypto.hpp>
+#include <oxen/quic/datagram.hpp>
+#include <oxen/quic/endpoint.hpp>
 #include <oxen/quic/format.hpp>
 #include <oxen/quic/gnutls_crypto.hpp>
+#include <oxen/quic/ip.hpp>
+#include <oxen/quic/loop.hpp>
+#include <oxen/quic/network.hpp>
+#include <oxen/quic/opt.hpp>
+#include <oxen/quic/path.hpp>
+#include <oxen/quic/result.hpp>
+#include <oxen/quic/stream.hpp>
+#include <oxen/quic/udp.hpp>
+#include <oxen/quic/utils.hpp>
 #include <oxenc/base64.h>
 #include <oxenc/hex.h>
 
@@ -533,8 +548,9 @@ namespace oxen::quic
     // loop and is not meant to be particularly performant.
     //
     // To use this you must:
-    // - construct this object via `auto delayer = packet_delayer::make(10ms);`.  You generally want
-    //   this to outlast the loop (i.e. declare it earlier) to avoid destruction issues.
+    // - construct this object via `auto delayer = packet_delayer::make(loop, 10ms);`.  It must not
+    //   outlive the loop (i.e. declare it after the loop); its destruction is dispatched to the loop
+    //   thread.
     // - construct the endpoint, passing `*delayer` to the `endpoint(...)` call (this object
     //   auto-converts into the appropriate manual routing option).
     // - call `delayer->init(ep)`, providing the endpoint which starts the actual underlying socket,
@@ -554,7 +570,7 @@ namespace oxen::quic
         explicit packet_delayer(std::chrono::milliseconds delay) : delay{delay} {}
 
       public:
-        static std::shared_ptr<packet_delayer> make(std::chrono::milliseconds delay = 10ms);
+        static std::shared_ptr<packet_delayer> make(Loop& loop, std::chrono::milliseconds delay = 10ms);
 
         // Non-copyable, non-movable:
         packet_delayer(packet_delayer&&) = delete;
