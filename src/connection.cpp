@@ -19,6 +19,7 @@
 
 #include <gnutls/crypto.h>
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cstdarg>
@@ -44,6 +45,15 @@ extern "C"
 namespace oxen::quic
 {
     using namespace std::literals;
+
+    // We hard-code this constant in utils.hpp to avoid needing to include all of ngtcp2, but verify
+    // here that it matches the ngtcp2 value.
+    static_assert(MIN_UDP_PAYLOAD == NGTCP2_MAX_UDP_PAYLOAD_SIZE);
+
+    // Connections without an opt::max_udp_payload use MAX_PMTUD_UDP_PAYLOAD as the default list's
+    // largest size, and ngtcp2 asserts every probe size is above the minimum.
+    static_assert(std::ranges::max(DEFAULT_PMTUD_PROBES) == MAX_PMTUD_UDP_PAYLOAD);
+    static_assert(std::ranges::min(DEFAULT_PMTUD_PROBES) > MIN_UDP_PAYLOAD);
 
     extern "C"
     {
@@ -588,11 +598,6 @@ namespace oxen::quic
         _close_quietly = true;
     }
 
-    void Connection::set_new_path(Path new_path)
-    {
-        _endpoint.job_queue.call([this, new_path]() { _path = new_path; });
-    }
-
     int Connection::recv_token(const uint8_t* token, size_t tokenlen)
     {
         // This should only be called by the client, and therefore this will always have a value
@@ -700,15 +705,39 @@ namespace oxen::quic
 
     void Connection::set_remote_addr(const ngtcp2_addr& new_remote)
     {
-        _endpoint.job_queue.call([this, new_remote]() { _path.set_new_remote(new_remote); });
+        _endpoint.job_queue.call([this, new_remote]() {
+            _path.set_new_remote(new_remote);
+            // A NAT64 address was the old remote's.
+            set_route({_path.local, std::nullopt});
+        });
     }
 
     void Connection::set_local_addr(Address new_local)
     {
-        _endpoint.job_queue.call([this, new_local]() {
-            Path new_path{new_local, _path.remote};
-            _path = new_path;
-        });
+        _endpoint.job_queue.call([this, new_local]() { set_route({new_local, nat64_remote()}); });
+    }
+
+    void Connection::set_route(route r)
+    {
+        if (r.nat64 != nat64_remote())
+            log::info(
+                    log_cat,
+                    "{} now reaching {} {}",
+                    reference_id(),
+                    _path.remote,
+                    r.nat64 ? "through NAT64 at {}"_format(*r.nat64) : "directly");
+        _path = Path{r.local, _path.remote};
+        if (r.nat64)
+            _nat64_path.emplace(r.local, *r.nat64);
+        else
+            _nat64_path.reset();
+    }
+
+    std::optional<Address> Connection::nat64_remote() const
+    {
+        if (_nat64_path)
+            return _nat64_path->remote;
+        return std::nullopt;
     }
 
     void Connection::store_associated_cid(const quic_cid& cid)
@@ -777,10 +806,12 @@ namespace oxen::quic
         // that happens ngtcp2 reverts all stream state.  So we prepend all our streams back into
         // pending_streams (in reverse order so that they will get opened in the same order) then
         // call check_pending_streams to reopen them.
+        std::vector<std::shared_ptr<Stream>> reverted;
         for (auto& [id, stream] : std::ranges::views::reverse(_streams))
         {
             log::debug(log_cat, "Resetting early stream {} and returning to pending streams", id);
             stream->revert_stream();
+            reverted.push_back(stream);
             stream->set_ready(false);
             if (!(id & 0x01))
             {  // Client-initiated stream (and we are always the client)
@@ -800,6 +831,13 @@ namespace oxen::quic
 
         if (dgrams)
             dgrams->early_data_end(false);
+
+        // Reverting made the streams' sent data unsent again, which can cross a watermark.  Checked
+        // only now because the callbacks are application code, which should not see the
+        // connection with its streams half moved.
+        for (auto& s : reverted)
+            if (s->_watermarking)
+                s->check_watermark();
     }
 
     void Connection::reset_early_datagrams()
@@ -858,8 +896,8 @@ namespace oxen::quic
             case 0:
                 // Spare connection IDs only ever arrive in packets, so this is when a migration that
                 // was waiting for one can go ahead.
-                if (_pending_local)
-                    migrate_local(*_pending_local, ts);
+                if (_pending_route)
+                    migrate(*_pending_route, ts);
                 packet_io_ready();
                 break;
             case NGTCP2_ERR_DRAINING:
@@ -1134,7 +1172,7 @@ namespace oxen::quic
 
         size_t too_big = 0;
         auto rv = _endpoint.send_packets(
-                _path, b.buf.data(), b.size.data(), b.ecn.data(), b.n_packets, !is_outbound(), &too_big);
+                send_path(), b.buf.data(), b.size.data(), b.ecn.data(), b.n_packets, !is_outbound(), &too_big);
         if (too_big)
             packet_too_big(too_big, pkt_updater.ts);
 
@@ -1142,6 +1180,11 @@ namespace oxen::quic
         {
             log::debug(log_cat, "Packet send blocked; stalling until the socket is writable");
             _endpoint.stall_send(*this);
+            return false;
+        }
+        else if (rv.unreachable())
+        {
+            send_unreachable(pkt_updater.ts);
             return false;
         }
         else if (rv.failure())
@@ -1307,6 +1350,7 @@ namespace oxen::quic
                         bufs.data(),
                         bufs.size(),
                         ts);
+                assert(_path.ngtcp2_lengths_match());
 
                 if (sending_fin && ndatalen >= 0)
                 {
@@ -1355,6 +1399,7 @@ namespace oxen::quic
                             dgram->data(),
                             dgram->size(),
                             ts);
+                    assert(_path.ngtcp2_lengths_match());
 
                     log::debug(log_cat, "ngtcp2_conn_writev_datagram returned a value of {}", nwrite);
 
@@ -1871,11 +1916,27 @@ namespace oxen::quic
         _endpoint.close_connection(*this, io_error{CONN_MTU_EXCEEDED});
     }
 
+    void Connection::send_unreachable(uint64_t ts)
+    {
+        // No route to the peer usually means the host's network is changing.  The host may already
+        // reach the peer some other way (from a new local address, or on Apple platforms through
+        // NAT64 or no longer through it), in which case an outbound connection moves to that.
+        // Otherwise there may be no route at all for a moment, mid-handover; rather than end the
+        // connection for it, its packets are lost like any others, as when a local queue is full:
+        // QUIC resends them once there is a route again (which network_changed() also looks for),
+        // and the idle timeout ends the connection if there never is.
+        if (is_outbound() && check_local_address(ts) != local_check::unchanged)
+            log::debug(log_cat, "{} found no route to {} on a changed network; carrying on", reference_id(), _path.remote);
+        else
+            log::debug(log_cat, "{} has no route to {}; its packets are lost", reference_id(), _path.remote);
+    }
+
     void Connection::local_address_mismatch(const Address& arrived_on, uint64_t ts)
     {
         // ngtcp2 only allows migrating once the handshake is confirmed, and a pending migration is
         // already retried after every packet is read.
-        if (!handshake_confirmed || arrived_on == _unconfirmed_local || arrived_on == _pending_local)
+        if (!handshake_confirmed || arrived_on == _unconfirmed_local ||
+            (_pending_route && arrived_on == _pending_route->local))
             return;
 
         if (check_local_address(ts) == local_check::unchanged)
@@ -1886,32 +1947,41 @@ namespace oxen::quic
     {
         assert(is_outbound());
 
-        if (!handshake_confirmed || draining || closing || dead)
+        if (draining || closing || dead)
             return local_check::unchanged;
 
-        auto source = _endpoint.local_address_for(_path.remote);
-        if (!source)
+        auto to = _endpoint.route_to(_path.remote);
+        if (!to)
             return local_check::unchanged;
-        if (*source == _path.local)
-        {
-            // The host's network may have changed and then changed back before we could migrate.
-            _pending_local.reset();
+
+        // ngtcp2 only migrates once the handshake is confirmed.  Until then the connection keeps
+        // its local address (an outbound connection's sends don't pin it anyway), and the migration
+        // follows once the handshake is, when a packet arrives on the host's actual address.
+        if (to->local != _path.local && handshake_confirmed)
+            return migrate(std::move(*to), ts);
+
+        // The host's network may have changed and then changed back before we could migrate.
+        _pending_route.reset();
+        if (to->nat64 == nat64_remote())
             return local_check::unchanged;
-        }
-        return migrate_local(*source, ts);
+
+        // Only the NAT64 address can change without a migration (or before the handshake allows
+        // one), and that needs none: ngtcp2 never sees it, only the address its packets go to.
+        set_route({_path.local, std::move(to->nat64)});
+        return local_check::rerouted;
     }
 
-    Connection::local_check Connection::migrate_local(Address local, uint64_t ts)
+    Connection::local_check Connection::migrate(route to, uint64_t ts)
     {
         if (draining || closing || dead)
         {
-            _pending_local.reset();
+            _pending_route.reset();
             return local_check::unchanged;
         }
 
         // A new path, with a new connection ID, makes ngtcp2 validate it and rediscover its PMTU
         // from the minimum, rather than carrying on at a size the new network may not allow.
-        Path new_path{local, _path.remote};
+        Path new_path{to.local, _path.remote};
         int rv = 0;
 #ifndef NDEBUG
         if (auto& blocked = _endpoint.batch().debug_blocked_migrations; blocked > 0)
@@ -1928,18 +1998,18 @@ namespace oxen::quic
             // The peer replaces each connection ID we retire, so this only lasts until its
             // replacement arrives (after the handshake, or after several migrations within a round
             // trip).
-            if (_pending_local != local)
+            if (_pending_route != to)
                 log::info(
                         log_cat,
                         "{} local address changed from {} to {}; migrating once the peer provides a connection ID",
                         reference_id(),
                         _path.local,
-                        local);
-            _pending_local = local;
+                        to.local);
+            _pending_route = std::move(to);
             return local_check::pending;
         }
 
-        _pending_local.reset();
+        _pending_route.reset();
         if (rv != 0)
         {
             log::warning(
@@ -1947,13 +2017,13 @@ namespace oxen::quic
                     "{} could not migrate from local address {} to {}: {}",
                     reference_id(),
                     _path.local,
-                    local,
+                    to.local,
                     ngtcp2_strerror(rv));
             return local_check::unchanged;
         }
 
-        log::info(log_cat, "{} local address changed from {} to {}; migrating", reference_id(), _path.local, local);
-        _path = new_path;
+        log::info(log_cat, "{} local address changed from {} to {}; migrating", reference_id(), _path.local, to.local);
+        set_route(std::move(to));
         _unconfirmed_local.reset();
         return local_check::migrated;
     }
@@ -2076,9 +2146,10 @@ namespace oxen::quic
         // Over IPv6 a 1500-byte MTU carries at most MAX_IPV6_UDP_PAYLOAD, and nothing between 1500
         // and jumbo frames is in real use, so larger sizes would only be wasted probes.  Capping
         // max_tx_udp_payload_size is enough: ngtcp2 skips any probe larger than it.  IPv4-mapped
-        // addresses (from dual-stack sockets) are sent as IPv4.
+        // addresses (from dual-stack sockets) are sent as IPv4, but a NAT64 address is IPv6.
+        const auto& dest = send_path().remote;
         const size_t family_max =
-                _path.remote.is_ipv6() && !_path.remote.is_ipv4_mapped_ipv6() ? MAX_IPV6_UDP_PAYLOAD : MAX_PMTUD_UDP_PAYLOAD;
+                dest.is_ipv6() && !dest.is_ipv4_mapped_ipv6() ? MAX_IPV6_UDP_PAYLOAD : MAX_PMTUD_UDP_PAYLOAD;
         size_t max_payload = MIN_UDP_PAYLOAD;
         for (auto size : probes)
             if (size <= family_max)
@@ -2138,6 +2209,7 @@ namespace oxen::quic
             const quic_cid& scid,
             const quic_cid& dcid,
             const Path& path,
+            std::optional<Address> nat64_remote,
             std::shared_ptr<IOContext> ctx,
             std::span<const std::string> alpns,
             std::chrono::nanoseconds default_handshake_timeout,
@@ -2155,6 +2227,7 @@ namespace oxen::quic
             _source_cid{scid},
             _dest_cid{dcid},
             _path{path},
+            _nat64_path{nat64_remote ? std::make_optional<Path>(path.local, *nat64_remote) : std::nullopt},
             _max_streams{context->config.max_streams ? context->config.max_streams : DEFAULT_MAX_BIDI_STREAMS},
             _packet_splitting{context->config.split_packet},
             tls_creds{context->tls_creds}
@@ -2380,6 +2453,7 @@ namespace oxen::quic
             const quic_cid& scid,
             const quic_cid& dcid,
             const Path& path,
+            std::optional<Address> nat64_remote,
             std::shared_ptr<IOContext> ctx,
             std::span<const std::string> alpns,
             std::chrono::nanoseconds default_handshake_timeout,
@@ -2396,6 +2470,7 @@ namespace oxen::quic
                 scid,
                 dcid,
                 path,
+                std::move(nat64_remote),
                 std::move(ctx),
                 alpns,
                 default_handshake_timeout,
