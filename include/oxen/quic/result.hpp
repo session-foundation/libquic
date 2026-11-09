@@ -67,6 +67,8 @@ namespace oxen::quic
     // The path can no longer carry packets of the size established for it; reconnecting
     // rediscovers the path's size.
     inline constexpr uint64_t CONN_MTU_EXCEEDED = ERROR_BASE + 1006;
+    // The handshake did not complete within the handshake timeout
+    inline constexpr uint64_t CONN_HANDSHAKE_TIMEOUT = ERROR_BASE + 1007;
 
     std::string quic_strerror(uint64_t e);
 
