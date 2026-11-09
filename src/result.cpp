@@ -35,6 +35,8 @@ namespace oxen::quic
                 return "Connection closed by idle timeout"s;
             case CONN_MTU_EXCEEDED:
                 return "Connection closed because the path can no longer carry its packets"s;
+            case CONN_HANDSHAKE_TIMEOUT:
+                return "Connection closed by handshake timeout"s;
             default:
                 return "Application error code {}"_format(e);
         }
