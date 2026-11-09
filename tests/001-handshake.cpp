@@ -1007,7 +1007,7 @@ namespace oxen::quic::test
         CHECK_FALSE(client_conn_closed.wait(25ms * macos_sucks));
 
         CHECK(client_conn_closed.wait(125ms * macos_sucks));
-        CHECK(client_errcode == static_cast<uint64_t>(NGTCP2_ERR_HANDSHAKE_TIMEOUT));
+        CHECK(client_errcode == CONN_HANDSHAKE_TIMEOUT);
     }
 
     TEST_CASE("001 - Handshake timeout stream close", "[001][handshake][timeout][stream]")
