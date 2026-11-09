@@ -599,15 +599,20 @@ namespace oxen::quic
         //  "The error not specifically mentioned, including NGTCP2_ERR_HANDSHAKE_TIMEOUT,
         //  should be dealt with by calling ngtcp2_conn_write_connection_close."
         //  https://github.com/ngtcp2/ngtcp2/issues/670#issuecomment-1417300346
-        if (ec.ngtcp2_code() == NGTCP2_ERR_HANDSHAKE_TIMEOUT)
+        //
+        // The close packet carries the ngtcp2 error, but the application's close callbacks get
+        // our own code for it so that they never need ngtcp2's headers to recognize it.
+        auto hook_ec = ec;
+        if (ec.is_ngtcp2 && ec.ngtcp2_code() == NGTCP2_ERR_HANDSHAKE_TIMEOUT)
         {
             log::info(
                     log_cat,
                     "Connection ({}) timed out during handshake; closing now with close packet",
                     conn.reference_id());
+            hook_ec = io_error{CONN_HANDSHAKE_TIMEOUT};
         }
 
-        _execute_close_hooks(conn, ec);
+        _execute_close_hooks(conn, hook_ec);
 
         ngtcp2_ccerr err;
         ngtcp2_ccerr_default(&err);
