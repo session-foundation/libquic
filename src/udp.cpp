@@ -106,6 +106,16 @@ namespace oxen::quic
 
 #ifdef OXEN_LIBQUIC_UDP_GSO
     constexpr bool GSO_SUPPORTED = true;
+
+    // A GSO send is a single UDP datagram until the kernel splits it, so its segments together must
+    // fit IPv4's 16-bit total length (65535 - 20 - 8).  IPv6 would allow 20 bytes more, but a
+    // dual-stack socket sends to IPv4-mapped addresses as IPv4.
+    constexpr size_t MAX_GSO_SEND_BYTES = 65507;
+
+    // The kernel also rejects a GSO send of more than UDP_MAX_SEGMENTS segments.  That isn't exported
+    // to userspace, and has been 64 since UDP GSO was added (Linux 4.18), rising to 128 in newer
+    // kernels; so 64 is the most every GSO-capable kernel accepts.
+    static_assert(MAX_BATCH <= 64);
 #else
     constexpr bool GSO_SUPPORTED = false;
 #endif
@@ -1136,9 +1146,11 @@ namespace oxen::quic
                 // two full-size packets, if it's shorter (it then has to be the last one).  Not
                 // allowing a short packet after just one means a lone PMTUD probe (always larger than
                 // everything else) can never start a batch, which would take the following packet
-                // down with it when the kernel rejects the whole oversized message with EINVAL.
+                // down with it when the kernel rejects the whole oversized message with EINVAL.  A
+                // packet that would take the batch past MAX_GSO_SEND_BYTES starts a new one instead.
                 if (i < n_pkts - 1 && bufsize[i] == gso_size && ecn[i + 1] == ecn[i] &&
-                    (bufsize[i + 1] == gso_size || (bufsize[i + 1] < gso_size && gso_count >= 2)))
+                    (bufsize[i + 1] == gso_size || (bufsize[i + 1] < gso_size && gso_count >= 2)) &&
+                    batch_bytes + bufsize[i + 1] <= MAX_GSO_SEND_BYTES)
                     continue;
 
                 auto& iov = iovs[msg_count];
