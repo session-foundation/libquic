@@ -524,7 +524,7 @@ namespace oxen::quic
 
         while (not swapped_queue.empty() && *running_ptr)
         {
-            auto job = swapped_queue.front();
+            auto job = std::move(swapped_queue.front());
             swapped_queue.pop();
 
             // We are inside a libevent callback, so an escaping exception would unwind through C

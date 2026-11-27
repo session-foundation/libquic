@@ -172,8 +172,8 @@ def main(ctx):
 
         linux("Debian sid", "debian-sid"),
         linux("Debian sid Debug", "debian-sid", cmake = {"CMAKE_BUILD_TYPE": "Debug"}),
-        clang(19),
-        full_llvm(19),
+        clang(23),
+        full_llvm(23),
         linux("Debian sid -GSO", "debian-sid", cmake = {"LIBQUIC_SEND": "sendmmsg"}),
         linux("Debian sid -mmsg", "debian-sid", cmake = {"LIBQUIC_SEND": "sendmsg", "LIBQUIC_RECVMMSG": False}),
         linux("Debian sid -GSO Debug", "debian-sid", cmake = {"CMAKE_BUILD_TYPE": "Debug", "LIBQUIC_SEND": "sendmmsg"}),
